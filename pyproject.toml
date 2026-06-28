@@ -1,15 +1,23 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "springmap"
-version = "0.1.0"
-description = "Spring Boot Codebase Knowledge Graph CLI"
+version = "1.0.0"
+description = "Knowledge graph builder for Spring Boot projects — optimised for LLM coding assistants"
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
-    "click>=8.1.7"
+    "click>=8.1",
+    "javalang>=0.13",
+    "PyYAML>=6.0",
+    "rich>=13.0",
 ]
-requires-python = ">=3.9"
 
 [project.scripts]
 springmap = "springmap.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["springmap*"]
