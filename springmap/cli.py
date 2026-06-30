@@ -36,6 +36,13 @@ METHOD_STYLE: dict[str, str] = {
     "PATCH": "cyan",
     "REQUEST": "magenta",
     "RPC": "bright_magenta",
+    "KAFKA": "orange3",
+    "RABBIT": "orange3",
+    "SQS": "orange3",
+    "JMS": "orange3",
+    "EVENT": "yellow",
+    "SCHEDULED": "bright_black",
+    "STREAM": "orange3",
 }
 
 
@@ -176,8 +183,14 @@ def build(ctx: click.Context, project_root: str, quiet: bool) -> None:
             "Other classes": len(graph.classes) - len(graph.controllers)
                             - len(graph.services) - len(graph.repositories)
                             - len(graph.entities),
-            "REST endpoints": sum(1 for _, m in graph.all_endpoints),
+            "REST endpoints": len(graph.all_endpoints),
         }
+        grpc_count = len(graph.grpc_services)
+        listener_count = len(graph.all_listeners)
+        if grpc_count:
+            counts["gRPC RPCs"] = grpc_count
+        if listener_count:
+            counts["Event listeners"] = listener_count
         for k, v in counts.items():
             tbl.add_row(k, str(v))
 
@@ -478,8 +491,9 @@ def show(ctx: click.Context, class_name: str) -> None:
 
     methods = cls.get("methods", [])
 
-    # Endpoints
-    endpoints = [m for m in methods if m.get("http_method")]
+    # Endpoints — REST and gRPC (request/response style)
+    from springmap.graph.models import categorize_verb
+    endpoints = [m for m in methods if m.get("http_method") and categorize_verb(m["http_method"]) in ("rest", "grpc")]
     if endpoints:
         console.print("\n[bold]Endpoints[/bold]")
         ep_tbl = Table(box=box.SIMPLE, padding=(0, 1))
@@ -498,7 +512,23 @@ def show(ctx: click.Context, class_name: str) -> None:
             )
         console.print(ep_tbl)
 
-    # Other methods
+    # Event listeners — Kafka/RabbitMQ/SQS/JMS/@EventListener/@Scheduled
+    listeners = [m for m in methods if m.get("http_method") and categorize_verb(m["http_method"]) == "listener"]
+    if listeners:
+        console.print("\n[bold]Event Listeners[/bold]")
+        lis_tbl = Table(box=box.SIMPLE, padding=(0, 1))
+        lis_tbl.add_column("Type", width=10)
+        lis_tbl.add_column("Topic / Cron", style="bright_cyan")
+        lis_tbl.add_column("Handler")
+        for m in listeners:
+            lis_tbl.add_row(
+                _method_badge(m.get("http_method", "")),
+                m.get("http_path") or "—",
+                m.get("signature", m.get("name", "")),
+            )
+        console.print(lis_tbl)
+
+    # Other methods (no endpoint/listener annotation)
     other = [m for m in methods if not m.get("http_method")]
     if other:
         console.print("\n[bold]Methods[/bold]")
@@ -601,34 +631,73 @@ def path(ctx: click.Context, from_class: str, to_class: str) -> None:
 # ─────────────────────────────────────────────
 
 @main.command()
+@click.argument("project_root", default=None, required=False, metavar="[PROJECT_ROOT]")
 @click.option(
     "--method",
-    type=click.Choice(["GET", "POST", "PUT", "DELETE", "PATCH", "ALL"], case_sensitive=False),
-    default="ALL",
-    show_default=True,
+    default="",
+    help="Filter by verb (GET/POST/.../KAFKA/RABBIT/...). Case-insensitive.",
 )
-@click.option("--filter", "path_filter", default="", help="Filter by path substring")
-@click.option("--grpc", "show_grpc", is_flag=True, help="Show gRPC services only")
+@click.option("--filter", "path_filter", default="", help="Filter by path/topic substring")
+@click.option("--grpc", "show_grpc", is_flag=True, help="Show gRPC RPCs only")
+@click.option("--listeners", "--events", "show_listeners", is_flag=True,
+              help="Show Kafka/RabbitMQ/SQS/JMS/@EventListener/@Scheduled only")
+@click.option("--all", "show_all", is_flag=True, help="Show REST + gRPC + listeners together")
 @click.pass_context
-def endpoints(ctx: click.Context, method: str, path_filter: str, show_grpc: bool) -> None:
-    """List all REST and gRPC endpoints."""
+def endpoints(
+    ctx: click.Context,
+    project_root: str | None,
+    method: str,
+    path_filter: str,
+    show_grpc: bool,
+    show_listeners: bool,
+    show_all: bool,
+) -> None:
+    """List REST endpoints (default), or gRPC / listener methods with flags.
+
+    \b
+    Examples:
+      springmap endpoints                  # REST endpoints only (default)
+      springmap endpoints .
+      springmap endpoints --method POST
+      springmap endpoints --filter /api/v1
+      springmap endpoints --grpc           # gRPC RPCs only
+      springmap endpoints --listeners      # Kafka/RabbitMQ/@Scheduled only
+      springmap endpoints --all            # everything, one table
+    """
+    if project_root is not None and ctx.obj["out_dir"] == "./springmap-out":
+        ctx.obj["out_dir"] = str(Path(project_root).resolve() / "springmap-out")
     engine = _require_graph(ctx)
 
-    type_filter = "grpc" if show_grpc else ""
-    method_arg = "" if method == "ALL" else method
-    eps = engine.list_endpoints(method_arg, path_filter, type_filter)
+    if sum([show_grpc, show_listeners, show_all]) > 1:
+        err_console.print("[red]Use only one of --grpc / --listeners / --all at a time.[/red]")
+        sys.exit(1)
+
+    if show_grpc:
+        kind, label = "grpc", "gRPC RPCs"
+    elif show_listeners:
+        kind, label = "listener", "Event Listeners & Scheduled Jobs"
+    elif show_all:
+        kind, label = "all", "All Endpoints (REST + gRPC + Listeners)"
+    else:
+        kind, label = "rest", "REST Endpoints"
+
+    eps = engine.list_endpoints(method_filter=method, path_filter=path_filter, kind=kind)
 
     if not eps:
-        console.print("[yellow]No endpoints found with the given filters.[/yellow]")
+        console.print(f"[yellow]No {label.lower()} found with the given filters.[/yellow]")
+        if kind == "rest":
+            console.print(
+                "[dim]Tip: gRPC and listener methods are hidden by default — "
+                "try --grpc or --listeners.[/dim]"
+            )
         return
 
-    label = "gRPC Services" if show_grpc else f"REST Endpoints ({len(eps)})"
-    console.print(Panel(label, border_style="bright_blue"))
+    console.print(Panel(f"{label} ({len(eps)})", border_style="bright_blue"))
 
     tbl = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
-    tbl.add_column("Method", width=9, no_wrap=True)
-    tbl.add_column("Path", style="bright_cyan")
-    tbl.add_column("Controller")
+    tbl.add_column("Type", width=10, no_wrap=True)
+    tbl.add_column("Path / Topic", style="bright_cyan")
+    tbl.add_column("Class")
     tbl.add_column("Handler")
     tbl.add_column("Body", style="dim")
     tbl.add_column("Returns", style="dim")
@@ -651,9 +720,18 @@ def endpoints(ctx: click.Context, method: str, path_filter: str, show_grpc: bool
 # ─────────────────────────────────────────────
 
 @main.command()
+@click.argument("project_root", default=None, required=False, metavar="[PROJECT_ROOT]")
 @click.pass_context
-def stats(ctx: click.Context) -> None:
-    """Graph statistics and parse quality report."""
+def stats(ctx: click.Context, project_root: str | None) -> None:
+    """Graph statistics and parse quality report.
+
+    \b
+    Examples:
+      springmap stats
+      springmap stats .
+    """
+    if project_root is not None and ctx.obj["out_dir"] == "./springmap-out":
+        ctx.obj["out_dir"] = str(Path(project_root).resolve() / "springmap-out")
     engine = _require_graph(ctx)
     s = engine.stats()
 
@@ -679,15 +757,25 @@ def stats(ctx: click.Context) -> None:
         if count == 0:
             continue
         _, label = TYPE_STYLE.get(t, ("", t.title()))
-        extra = ""
-        if t == "controller":
-            extra = f"{s.total_endpoints} endpoint(s)"
-        tbl.add_row(label, str(count), extra)
+        tbl.add_row(label, str(count), "")
 
     tbl.add_section()
     tbl.add_row("[bold]Total classes[/bold]", str(s.total_classes), f"{s.total_methods} method(s)")
 
     console.print(tbl)
+
+    # Endpoint breakdown — REST / gRPC / Listeners are tracked separately so
+    # one category can never silently hide another (the bug this fixes).
+    console.print("\n[bold]Endpoint Breakdown[/bold]")
+    ep_tbl = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    ep_tbl.add_column("", style="dim")
+    ep_tbl.add_column("", justify="right")
+    ep_tbl.add_row("REST endpoints (controllers + OpenAPI)", str(s.rest_endpoints))
+    if s.grpc_endpoints:
+        ep_tbl.add_row("gRPC RPCs", str(s.grpc_endpoints))
+    if s.listener_endpoints:
+        ep_tbl.add_row("Event listeners / scheduled jobs", str(s.listener_endpoints))
+    console.print(ep_tbl)
 
     # Parse quality
     console.print("\n[bold]Parse Quality[/bold]")
@@ -715,13 +803,27 @@ def stats(ctx: click.Context) -> None:
 # ─────────────────────────────────────────────
 
 @main.command()
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@click.argument("project_root", default=None, required=False, metavar="[PROJECT_ROOT]")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
-def clean(ctx: click.Context, yes: bool) -> None:
-    """Delete the springmap-out/ directory."""
-    out = _out_path(ctx)
+def clean(ctx: click.Context, project_root: str | None, yes: bool) -> None:
+    """Delete the springmap-out/ directory.
+
+    \b
+    Examples:
+      springmap clean                 # delete ./springmap-out
+      springmap clean .               # same — project root is optional
+      springmap clean /path/to/proj   # delete /path/to/proj/springmap-out
+    """
+    # If project root is given, compute out/ relative to it
+    # (mirrors how build/update work).  --out always wins when set explicitly.
+    if project_root is not None and ctx.obj["out_dir"] == "./springmap-out":
+        out = Path(project_root).resolve() / "springmap-out"
+    else:
+        out = _out_path(ctx)
+
     if not out.exists():
-        console.print("[dim]Nothing to clean — directory does not exist.[/dim]")
+        console.print(f"[dim]Nothing to clean — {out} does not exist.[/dim]")
         return
     if not yes:
         click.confirm(f"Delete {out}?", abort=True)

@@ -11,6 +11,9 @@ Filter syntax supported in query strings:
   used-by:UserCtrl      — classes that UserCtrl depends on
   path:/api/users       — endpoint path contains substring
   method:GET            — only GET endpoints
+  kind:rest             — only REST endpoints (default for endpoints listing)
+  kind:grpc             — only gRPC RPCs
+  kind:listener         — only Kafka/RabbitMQ/SQS/JMS/EventListener/Scheduled
   pkg:com.example.svc   — package starts with prefix
   src:openapi           — nodes sourced from OpenAPI (not Java)
   src:proto             — nodes sourced from .proto files
@@ -25,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from springmap.exporters.json_exporter import load_graph_json
+from springmap.graph.models import HTTP_VERBS, LISTENER_VERBS, RPC_VERB, categorize_verb
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +77,10 @@ class StatsResult:
     by_type: dict[str, int]
     total_classes: int
     total_methods: int
-    total_endpoints: int
+    total_endpoints: int        # REST only — kept for backward compatibility
+    rest_endpoints: int
+    grpc_endpoints: int
+    listener_endpoints: int
     ast_parsed: int
     regex_fallback: int
     openapi_nodes: int
@@ -238,15 +245,19 @@ class QueryEngine:
 
             matched_classes.append(cls)
 
-        # ── Endpoint-specific filters: path: and method: ──
-        if "path" in filters or "method" in filters:
+        # ── Endpoint-specific filters: path:, method:, kind: ──
+        if "path" in filters or "method" in filters or "kind" in filters:
+            requested_kind = filters.get("kind", "").lower()
             for cls in classes.values():
                 for m in cls.get("methods", []):
-                    if not m.get("http_method"):
+                    hm = m.get("http_method")
+                    if not hm:
                         continue
                     if "path" in filters and filters["path"] not in (m.get("http_path") or ""):
                         continue
-                    if "method" in filters and m.get("http_method", "").upper() != filters["method"].upper():
+                    if "method" in filters and hm.upper() != filters["method"].upper():
+                        continue
+                    if requested_kind and categorize_verb(hm) != requested_kind:
                         continue
                     matched_endpoints.append({"cls": cls, "method": m})
 
@@ -311,16 +322,28 @@ class QueryEngine:
         method_filter: str = "",
         path_filter: str = "",
         type_filter: str = "",
+        kind: str = "rest",
     ) -> list[dict]:
         """
-        Return all endpoints, optionally filtered by HTTP method, path substring,
-        or node type (controller / openapi / grpc).
+        Return endpoints, filtered by category, HTTP/listener verb, path substring,
+        or node type (controller / openapi / grpc / component).
 
-        gRPC service RPC methods are included when type_filter='grpc' and
-        are given http_method='RPC' for uniform display.
+        kind controls which CATEGORY of endpoint is returned:
+          'rest'     (default) — only GET/POST/PUT/DELETE/PATCH/REQUEST
+          'grpc'     — only gRPC RPC methods (verb shown as 'RPC')
+          'listener' — only Kafka/RabbitMQ/SQS/JMS/@EventListener/@Scheduled
+          'all'      — everything, regardless of category
+
+        BUG FIX: previously this had no category concept at all, so calling
+        list_endpoints() with no arguments silently returned BOTH REST and
+        gRPC results mixed together — and on projects where REST endpoints
+        failed to parse (a separate javalang bug, now fixed), only the gRPC
+        rows were visible, making it look like REST endpoints didn't exist.
+        Listener methods (@KafkaListener etc.) were not handled at all.
         """
         classes = self.classes
         results: list[dict] = []
+        kind = (kind or "rest").lower()
 
         for cls in classes.values():
             node_type = cls.get("node_type", "")
@@ -332,23 +355,29 @@ class QueryEngine:
             for m in cls.get("methods", []):
                 hm = m.get("http_method")
 
-                # gRPC RPC methods carry no http_method — treat them as "RPC"
+                # gRPC service methods carry no http_method in the parser output —
+                # synthesize "RPC" so they're categorizable and displayable.
                 if not hm:
                     if not is_grpc:
                         continue
-                    hm = "RPC"
+                    hm = RPC_VERB
+
+                category = categorize_verb(hm)
+                if kind != "all" and category != kind:
+                    continue
 
                 if method_filter and hm.upper() != method_filter.upper():
                     continue
 
-                # For gRPC, use the method name as the "path"
-                rpc_path = m.get("http_path") or (f"/{m.get('name', '')}" if is_grpc else "/")
-                if path_filter and path_filter not in rpc_path:
+                # For gRPC, fall back to "/methodName" as a readable path
+                ep_path = m.get("http_path") or (f"/{m.get('name', '')}" if is_grpc else "/")
+                if path_filter and path_filter not in ep_path:
                     continue
 
                 results.append({
                     "http_method": hm,
-                    "path": rpc_path,
+                    "category": category,
+                    "path": ep_path,
                     "controller": cls["name"],
                     "file": cls.get("file_path", ""),
                     "handler": m.get("name", ""),
@@ -368,7 +397,9 @@ class QueryEngine:
 
         by_type: dict[str, int] = {}
         total_methods = 0
-        total_endpoints = 0
+        rest_count = 0
+        grpc_count = 0
+        listener_count = 0
         regex_fb = 0
         openapi_n = 0
         proto_n = 0
@@ -376,8 +407,24 @@ class QueryEngine:
         for cls in classes.values():
             t = cls.get("node_type", "unknown")
             by_type[t] = by_type.get(t, 0) + 1
-            total_methods += len(cls.get("methods", []))
-            total_endpoints += sum(1 for m in cls.get("methods", []) if m.get("http_method"))
+            methods = cls.get("methods", [])
+            total_methods += len(methods)
+
+            is_grpc_cls = t == "grpc"
+            for m in methods:
+                hm = m.get("http_method")
+                if not hm and is_grpc_cls:
+                    hm = RPC_VERB  # synthesize, same as list_endpoints()
+                if not hm:
+                    continue
+                category = categorize_verb(hm)
+                if category == "rest":
+                    rest_count += 1
+                elif category == "grpc":
+                    grpc_count += 1
+                elif category == "listener":
+                    listener_count += 1
+
             if cls.get("parse_error") == "regex-fallback":
                 regex_fb += 1
             src = cls.get("source", "java")
@@ -397,7 +444,10 @@ class QueryEngine:
             by_type=by_type,
             total_classes=len(classes),
             total_methods=total_methods,
-            total_endpoints=total_endpoints,
+            total_endpoints=rest_count,
+            rest_endpoints=rest_count,
+            grpc_endpoints=grpc_count,
+            listener_endpoints=listener_count,
             ast_parsed=max(0, ast_n),
             regex_fallback=regex_fb,
             openapi_nodes=openapi_n,

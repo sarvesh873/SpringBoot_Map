@@ -35,39 +35,80 @@ _HTTP_VERBS = {"get", "post", "put", "delete", "patch", "head", "options"}
 
 # ─────────────────────────────────────────────
 # File discovery
+#
+# BUG FIX: the old version only checked a fixed list of top-level dirs with
+# non-recursive .glob(), so files nested deeper than one level — e.g.
+# src/main/resources/api/openapi.yaml, src/main/resources/contracts/v2/spec.yaml —
+# were silently skipped. It also used a plain substring check for "openapi:"
+# which fails on JSON specs where the key is quoted: {"openapi": "3.0.0"}
+# contains openapi": not openapi: (extra quote breaks the match).
 # ─────────────────────────────────────────────
 
+# Directories we never want to walk into — build artifacts, deps, VCS internals
+_EXCLUDED_DIR_NAMES = frozenset({
+    "target", "build", "node_modules", ".git", ".idea", ".vscode",
+    "out", "dist", ".gradle", ".mvn",
+})
+
+# Skip absurdly large files — a real OpenAPI spec is never this big
+_MAX_SPEC_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _is_excluded(path: Path) -> bool:
+    return any(part in _EXCLUDED_DIR_NAMES or part.startswith(".") for part in path.parts)
+
+
 def _is_openapi_file(path: Path) -> bool:
-    """Quick check — read only the first 600 bytes."""
+    """
+    Reliable detection that works for both YAML and JSON specs.
+
+    Strategy:
+      1. Cheap pre-filter: does "openapi" or "swagger" appear anywhere in the
+         first 4 KB (handles huge info/description blocks before the key)?
+      2. Confirmation: parse the file with yaml.safe_load (a superset of JSON,
+         so this works for .json specs too) and check for a top-level
+         'openapi' or 'swagger' key — avoids both false positives (a comment
+         that happens to mention "openapi") and false negatives (quoting
+         differences between YAML and JSON).
+    """
     try:
-        snippet = path.read_bytes()[:600].decode("utf-8", errors="replace")
-        return "openapi:" in snippet or "swagger:" in snippet
+        if path.stat().st_size > _MAX_SPEC_SIZE_BYTES:
+            return False
+        snippet = path.read_bytes()[:4096].decode("utf-8", errors="replace").lower()
     except OSError:
         return False
 
+    if "openapi" not in snippet and "swagger" not in snippet:
+        return False
+
+    if not HAS_YAML:
+        # No yaml lib to confirm — trust the substring pre-filter
+        return True
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return False
+
+    return isinstance(data, dict) and ("openapi" in data or "swagger" in data)
+
 
 def find_openapi_files(project_root: str) -> list[Path]:
+    """
+    Recursively search the ENTIRE project (minus build/dependency dirs) for
+    OpenAPI/Swagger spec files in .yaml, .yml, or .json format — regardless
+    of how deeply nested they are or what they're named.
+    """
     root = Path(project_root)
-    search_dirs = [
-        root,
-        root / "src" / "main" / "resources",
-        root / "src" / "main" / "resources" / "static",
-        root / "docs",
-        root / "api",
-        root / "openapi",
-        root / "swagger",
-    ]
     found: list[Path] = []
-    seen: set[Path] = set()
 
-    for d in search_dirs:
-        if not d.exists():
-            continue
-        for pattern in ("*.yaml", "*.yml", "*.json"):
-            for f in d.glob(pattern):
-                if f not in seen and _is_openapi_file(f):
-                    found.append(f)
-                    seen.add(f)
+    for pattern in ("*.yaml", "*.yml", "*.json"):
+        for f in root.rglob(pattern):
+            if _is_excluded(f):
+                continue
+            if _is_openapi_file(f):
+                found.append(f)
 
     return found
 

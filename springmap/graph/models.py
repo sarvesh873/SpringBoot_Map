@@ -49,6 +49,27 @@ HTTP_MAPPING_ANNOTATIONS = {
     "RequestMapping": "REQUEST",
 }
 
+# Single source of truth for verb categorization — imported by java_parser,
+# query/engine, exporters, and cli so "what counts as REST vs a listener"
+# never drifts between modules.
+HTTP_VERBS: frozenset[str] = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "REQUEST"})
+LISTENER_VERBS: frozenset[str] = frozenset({
+    "KAFKA", "RABBIT", "SQS", "JMS", "EVENT", "SCHEDULED", "STREAM",
+})
+RPC_VERB = "RPC"
+
+
+def categorize_verb(verb: Optional[str]) -> str:
+    """Classify an http_method value into 'rest' | 'grpc' | 'listener' | 'other'."""
+    v = (verb or "").upper()
+    if v in HTTP_VERBS:
+        return "rest"
+    if v == RPC_VERB:
+        return "grpc"
+    if v in LISTENER_VERBS:
+        return "listener"
+    return "other"
+
 
 @dataclass
 class AnnotationInfo:
@@ -262,11 +283,53 @@ class ProjectGraph:
         return self.get_by_type(NodeType.ENTITY)
 
     @property
+    def openapi_nodes(self) -> list[ClassNode]:
+        return self.get_by_type(NodeType.OPENAPI)
+
+    @property
+    def grpc_services(self) -> list[ClassNode]:
+        return self.get_by_type(NodeType.GRPC)
+
+    @property
     def all_endpoints(self) -> list[tuple[ClassNode, MethodInfo]]:
-        result = []
-        for cls in self.controllers:
-            for method in cls.endpoints:
+        """
+        All REST-style endpoints (GET/POST/PUT/DELETE/PATCH/REQUEST) from BOTH
+        Java @RestController classes AND OpenAPI-spec-derived virtual nodes.
+
+        BUG FIX: previously this only scanned self.controllers, so any endpoint
+        defined purely in an openapi.yaml / swagger.yaml (gateway routes, generated
+        contracts) never appeared in GRAPH.md or `springmap stats`.
+        """
+        result: list[tuple[ClassNode, MethodInfo]] = []
+        for cls in self.classes.values():
+            if cls.node_type not in (NodeType.CONTROLLER, NodeType.OPENAPI):
+                continue
+            for method in cls.methods:
+                if method.http_method and method.http_method.upper() in HTTP_VERBS:
+                    result.append((cls, method))
+        return result
+
+    @property
+    def all_grpc_methods(self) -> list[tuple[ClassNode, MethodInfo]]:
+        """All gRPC RPC methods from .proto-derived service nodes."""
+        result: list[tuple[ClassNode, MethodInfo]] = []
+        for cls in self.grpc_services:
+            for method in cls.methods:
                 result.append((cls, method))
+        return result
+
+    @property
+    def all_listeners(self) -> list[tuple[ClassNode, MethodInfo]]:
+        """
+        All Kafka / RabbitMQ / SQS / JMS / @EventListener / @Scheduled methods,
+        scanned across EVERY class (not just NodeType.COMPONENT) since listener
+        methods commonly live inside @Service classes too.
+        """
+        result: list[tuple[ClassNode, MethodInfo]] = []
+        for cls in self.classes.values():
+            for method in cls.methods:
+                if method.http_method and method.http_method.upper() in LISTENER_VERBS:
+                    result.append((cls, method))
         return result
 
     def to_dict(self) -> dict:

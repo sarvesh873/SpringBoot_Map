@@ -68,6 +68,16 @@ def _section_header(graph: ProjectGraph) -> str:
     entity_count = len(graph.entities)
     total = len(graph.classes)
 
+    rest_count = len(graph.all_endpoints)
+    grpc_count = len(graph.grpc_services)
+    listener_count = len(graph.all_listeners)
+
+    extra_rows = ""
+    if grpc_count:
+        extra_rows += f"| gRPC Services | {grpc_count} |\n"
+    if listener_count:
+        extra_rows += f"| Event Listeners | {listener_count} |\n"
+
     return f"""# 🗺️ SpringMap — {graph.project_name} Knowledge Graph
 
 > **Generated**: {graph.generated_at}  
@@ -85,11 +95,13 @@ def _section_header(graph: ProjectGraph) -> str:
 │  This file is the complete knowledge graph of the codebase.              │
 │  Before reading ANY .java file, search this document first.              │
 │                                                                           │
-│  • Need to find an endpoint?     → See SECTION 2: REST Endpoints         │
-│  • Need to know what a class does? → Search class name in SECTION 3-6   │
-│  • Need call chain for a feature? → Methods include "Calls:" rows        │
-│  • Need entity fields?           → See SECTION 5: Entities               │
-│  • Need config values?           → See SECTION 7: Configuration          │
+│  • Need a REST endpoint?           → See SECTION 2: REST Endpoints       │
+│  • Need a gRPC RPC?                → See SECTION 3: gRPC Services        │
+│  • Need a Kafka/Rabbit consumer?   → See SECTION 4: Event Listeners      │
+│  • Need to know what a class does? → Search class name below            │
+│  • Need a call chain for a feature? → Methods include "Calls:" rows      │
+│  • Need entity fields?             → See the Entities section            │
+│  • Need config values?             → See the Configuration section       │
 │                                                                           │
 │  Only open a source file when you need the actual implementation body.   │
 │  Class structure, signatures, and dependencies are ALL in this file.     │
@@ -106,7 +118,8 @@ def _section_header(graph: ProjectGraph) -> str:
 | Services | {svc_count} |
 | Repositories | {repo_count} |
 | Entities | {entity_count} |
-| Total Classes | {total} |
+| REST Endpoints | {rest_count} |
+{extra_rows}| Total Classes | {total} |
 | Server Port | `{cfg.server_port}` |
 | Context Path | `{cfg.context_path or "/"}` |
 | Active Profiles | `{profiles}` |
@@ -145,11 +158,69 @@ def _section_endpoints(graph: ProjectGraph) -> str:
 """
 
 
+def _section_grpc(graph: ProjectGraph) -> str:
+    """gRPC service RPCs from .proto files — distinct from REST, never mixed in."""
+    rpcs = graph.all_grpc_methods
+    if not rpcs:
+        return ""
+
+    rows: list[str] = []
+    for cls, method in sorted(rpcs, key=lambda t: (t[0].name, t[1].name)):
+        params = ", ".join(_short(str(p)) for p in method.parameters)
+        ret = _short(method.return_type)
+        rows.append(
+            f"| {cls.name} | `{method.name}({_md_safe(params)})` | `{_md_safe(ret)}` | `{_md_safe(cls.file_path)}` |"
+        )
+
+    table = "\n".join(rows)
+    return f"""---
+
+## 3 · gRPC Services
+
+| Service | RPC Method | Returns | Source |
+|---------|------------|---------|--------|
+{table}
+
+"""
+
+
+def _section_listeners(graph: ProjectGraph) -> str:
+    """
+    Kafka / RabbitMQ / SQS / JMS / @EventListener / @Scheduled methods.
+
+    These are intentionally kept SEPARATE from REST Endpoints — a Kafka
+    consumer is not an HTTP route, and treating it as one (or omitting it
+    entirely) was a prior bug. Listed here so Copilot can find message
+    consumers without grepping every @Service class.
+    """
+    listeners = graph.all_listeners
+    if not listeners:
+        return ""
+
+    rows: list[str] = []
+    for cls, method in sorted(listeners, key=lambda t: (t[1].http_method or "", t[0].name)):
+        topic = method.http_path or "—"
+        rows.append(
+            f"| `{method.http_method}` | {_md_safe(topic)} | {cls.name} | `{method.name}()` | `{_md_safe(cls.file_path)}` |"
+        )
+
+    table = "\n".join(rows)
+    return f"""---
+
+## 4 · Event Listeners & Scheduled Jobs
+
+| Type | Topic / Queue / Cron | Class | Handler | File |
+|------|----------------------|-------|---------|------|
+{table}
+
+"""
+
+
 def _section_controllers(graph: ProjectGraph) -> str:
     if not graph.controllers:
         return ""
 
-    parts = ["---\n\n## 3 · Controllers\n"]
+    parts = ["---\n\n## 5 · Controllers\n"]
     for cls in graph.controllers:
         parts.append(_class_block(cls, graph, show_endpoints=True))
     return "\n".join(parts)
@@ -159,7 +230,7 @@ def _section_services(graph: ProjectGraph) -> str:
     if not graph.services:
         return ""
 
-    parts = ["---\n\n## 4 · Services\n"]
+    parts = ["---\n\n## 6 · Services\n"]
     for cls in graph.services:
         parts.append(_class_block(cls, graph, show_endpoints=False))
     return "\n".join(parts)
@@ -170,7 +241,7 @@ def _section_repositories(graph: ProjectGraph) -> str:
     if not repos:
         return ""
 
-    parts = ["---\n\n## 5 · Repositories\n"]
+    parts = ["---\n\n## 7 · Repositories\n"]
     for cls in repos:
         parts.append(_repository_block(cls, graph))
     return "\n".join(parts)
@@ -181,20 +252,21 @@ def _section_entities(graph: ProjectGraph) -> str:
     if not entities:
         return ""
 
-    parts = ["---\n\n## 6 · Entities\n"]
+    parts = ["---\n\n## 8 · Entities\n"]
     for cls in entities:
         parts.append(_entity_block(cls))
     return "\n".join(parts)
 
 
 def _section_other(graph: ProjectGraph) -> str:
-    skip = {NodeType.CONTROLLER, NodeType.SERVICE, NodeType.REPOSITORY, NodeType.ENTITY}
+    skip = {NodeType.CONTROLLER, NodeType.SERVICE, NodeType.REPOSITORY, NodeType.ENTITY,
+            NodeType.OPENAPI, NodeType.GRPC}
     others = [c for c in sorted(graph.classes.values(), key=lambda c: c.name)
               if c.node_type not in skip]
     if not others:
         return ""
 
-    parts = ["---\n\n## 7 · Other Components\n"]
+    parts = ["---\n\n## 9 · Other Components\n"]
 
     # Group by type
     by_type: dict[str, list[ClassNode]] = {}
@@ -213,7 +285,7 @@ def _section_other(graph: ProjectGraph) -> str:
 
 def _section_config(graph: ProjectGraph) -> str:
     cfg = graph.config
-    parts = ["---\n\n## 8 · Configuration\n\n"]
+    parts = ["---\n\n## 10 · Configuration\n\n"]
 
     parts.append("| Key | Value |\n|-----|-------|\n")
     parts.append(f"| `server.port` | `{cfg.server_port}` |\n")
@@ -246,7 +318,7 @@ def _section_dependency_graph(graph: ProjectGraph) -> str:
     if not chains:
         return ""
 
-    return "---\n\n## 9 · Dependency Map\n\n```\n" + "\n".join(chains) + "\n```\n\n"
+    return "---\n\n## 11 · Dependency Map\n\n```\n" + "\n".join(chains) + "\n```\n\n"
 
 
 def _section_maven(graph: ProjectGraph) -> str:
@@ -256,7 +328,7 @@ def _section_maven(graph: ProjectGraph) -> str:
     spring_deps = [d for d in graph.maven_dependencies if "spring" in d.lower() or "boot" in d.lower()]
     other_deps = [d for d in graph.maven_dependencies if d not in spring_deps]
 
-    lines = ["---\n\n## 10 · Key Dependencies\n\n**Spring / Boot:**\n"]
+    lines = ["---\n\n## 12 · Key Dependencies\n\n**Spring / Boot:**\n"]
     for d in sorted(spring_deps)[:20]:
         lines.append(f"- `{d}`")
     if other_deps:
@@ -367,8 +439,6 @@ def _entity_block(cls: ClassNode) -> str:
                 notes.append("PK")
             if f.relationship:
                 notes.append(f"@{f.relationship}")
-            if not f.is_nullable if hasattr(f, "is_nullable") else False:
-                notes.append("NOT NULL")
             note_str = ", ".join(notes) if notes else "—"
             lines.append(f"| `{f.name}` | `{_short(f.type)}` | `{col}` | {note_str} |")
         lines.append("")
@@ -404,14 +474,16 @@ def export_markdown(graph: ProjectGraph, out_dir: Path) -> Path:
     sections = [
         _section_header(graph),
         _section_endpoints(graph),
+        _section_grpc(graph),
+        _section_listeners(graph),
         _section_controllers(graph),
         _section_services(graph),
         _section_repositories(graph),
         _section_entities(graph),
+        _section_other(graph),
         _section_config(graph),
         _section_dependency_graph(graph),
         _section_maven(graph),
-        _section_other(graph),
     ]
 
     content = "\n".join(s for s in sections if s)
