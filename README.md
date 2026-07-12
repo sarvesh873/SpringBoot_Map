@@ -40,31 +40,49 @@ springmap build .
 ```
 
 Output in `./springmap-out/`:
-- `GRAPH.md` — attach this to Copilot when coding
+- `GRAPH_COMPACT.md` — attach **this** to Copilot when coding (token-optimized)
+- `GRAPH.md` — full detail, for human reference/browsing
+- `graph.html` — interactive D3.js visualization, open in a browser
 - `graph.json` — queried by all CLI commands
 - `manifest.json` — tracks file hashes for incremental updates
 
-### 3. Configure Copilot to use the graph
+### 3. Configure Copilot to use the graph {#using-springmap-with-copilot}
+
+Attach **`springmap-out/GRAPH_COMPACT.md`**, not `GRAPH.md`. It has the
+same structural information (classes, endpoints, DI map, Kafka listeners)
+in about half the tokens — no call chains, no entity field tables, no
+Maven dependency listing. Copilot needs the index to avoid reading files;
+it doesn't need the full documentation view.
 
 Add to `.github/copilot-instructions.md` (or your team's custom instructions):
 
 ```
 ## Project Knowledge Graph
 
-A complete class/endpoint graph lives in springmap-out/GRAPH.md.
+A compact structural index lives in springmap-out/GRAPH_COMPACT.md.
 
-RULE: Before reading any .java source file, search GRAPH.md for:
-  - The class name you need
-  - The endpoint path you need to modify
-  - The entity fields you need
+RULE: Before reading any .java source file, search GRAPH_COMPACT.md for:
+  - The class name you need (Class Index section, grouped by layer)
+  - The endpoint path you need to modify (REST Endpoints table)
+  - The Kafka/RabbitMQ topic you need (Event Listeners table)
+  - Which class injects which (Injects / Used by lines)
 
-Only open Java source files when you need the actual method body.
-Class structure, method signatures, dependencies, and endpoint
-contracts are fully documented in GRAPH.md.
-
-To find which service handles an endpoint: see GRAPH.md Section 2 (Endpoints).
-To find a class's dependencies: search GRAPH.md for the class name.
+Only open a .java file when you need the actual method body — the
+compact index has structure, not implementation.
 ```
+
+**Does this actually save tokens?** Only if Copilot stops reading source
+files because of it — attaching `GRAPH_COMPACT.md` on top of Copilot's
+normal auto-file-scanning costs MORE tokens, not less. The instruction
+above exists specifically to make Copilot substitute the graph for file
+reads, not add to them. For a 60-class project, `GRAPH_COMPACT.md` is
+roughly 5,000 tokens versus ~12,000 tokens for Copilot auto-reading 10
+Java files per question — but that saving only materializes if the
+instruction is followed. Check `springmap stats` periodically; if your
+project grows past ~150 classes, `GRAPH_COMPACT.md` itself starts costing
+more than targeted file reads, and querying via the CLI (`springmap show
+X`, `springmap query "..."`) becomes the better approach for large
+codebases.
 
 ### 4. Keep the graph current
 
@@ -79,7 +97,7 @@ Add as a git pre-commit hook:
 # .git/hooks/pre-commit
 #!/bin/sh
 springmap update .
-git add springmap-out/GRAPH.md springmap-out/graph.json
+git add springmap-out/GRAPH_COMPACT.md springmap-out/graph.json
 ```
 
 ---
@@ -198,6 +216,47 @@ counts broken out separately (never combined into one ambiguous total).
 springmap stats
 ```
 
+### `info`
+
+Deep breakdown of `pom.xml` + `application.yml`. Cross-references your
+datasource URL against your dependencies — flags it if the URL says
+`postgresql` but no PostgreSQL driver exists in the POM. Every detected
+Spring starter is annotated with graph-derived counts (e.g. "2 REST
+endpoints", "1 @KafkaListener").
+
+```bash
+springmap info
+springmap info .
+```
+
+Shows: Maven coordinates, Java/Spring Boot versions, server port, context
+path, active profiles, datasource URL + driver + inferred DB type, JPA
+settings, every dependency grouped by category (starters, database,
+messaging, security, testing), and all custom `application.yml` properties
+flattened to dot notation (`app.kafka.topic`, `app.retry.max-attempts`, …).
+
+### `graph`
+
+Generates an interactive D3.js force-directed graph of the entire project
+as a single self-contained HTML file — opens in any browser, no server
+needed.
+
+```bash
+springmap graph
+springmap graph --open     # generate + open in default browser
+```
+
+Features: nodes color-coded and shaped by Spring layer (controller = blue
+circle, service = green rect, repository = amber diamond, entity = purple
+hexagon, gRPC = magenta, Kafka consumer = dashed orange), click any node
+for a detail panel (file, endpoints, DI dependencies, listeners), filter
+by layer, search by class name, toggle DI/event edges and labels, drag to
+reposition, zoom/pan.
+
+This is for human/team use — architecture reviews, onboarding, tracing
+data flows visually. It is not meant to be attached to Copilot; use
+`GRAPH_COMPACT.md` for that (see below).
+
 ### `clean`
 
 Delete the `springmap-out/` directory.
@@ -210,6 +269,21 @@ springmap clean --yes    # skip confirmation
 ---
 
 ## Output files
+
+### `GRAPH_COMPACT.md` — attach this to Copilot
+
+The token-optimized index. ~55% smaller than `GRAPH.md` — only class names,
+types, files, DI edges, REST endpoint table, event listener table, and
+plain method names. No call chains, no entity field details, no Maven
+section. This is the file to attach to Copilot Chat or reference in
+`.github/copilot-instructions.md`. See [Using SpringMap with Copilot](#using-springmap-with-copilot) below.
+
+### `graph.html`
+
+Self-contained interactive D3.js visualization — open in any browser, no
+server required. For humans, not for Copilot: architecture reviews, new
+engineer onboarding, tracing data flows, spotting over-coupled classes.
+Generated automatically by `build`/`update`, or on demand with `springmap graph`.
 
 ### `GRAPH.md`
 
@@ -228,9 +302,15 @@ Structured for LLM consumption. Sections:
 11. **Dependency map** — textual call chains (Controller → Service → Repository)
 12. **Maven dependencies**
 
+Use this as human-readable reference documentation. It's larger than
+`GRAPH_COMPACT.md` on purpose — it's meant to be read, not attached to
+every Copilot request.
+
 ### `graph.json`
 
-Full serialized graph. Queried by all CLI commands. Schema:
+Full serialized graph. Queried by all CLI commands. Never attach this to
+Copilot directly — it's larger than `GRAPH.md` and JSON syntax overhead
+wastes tokens versus the markdown exports. Schema:
 
 ```json
 {

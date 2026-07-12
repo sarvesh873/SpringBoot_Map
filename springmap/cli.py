@@ -146,6 +146,8 @@ def build(ctx: click.Context, project_root: str, quiet: bool) -> None:
     """Build the full knowledge graph from scratch."""
     from springmap.exporters.json_exporter import export_json
     from springmap.exporters.markdown_exporter import export_markdown
+    from springmap.exporters.compact_exporter import export_compact_markdown
+    from springmap.exporters.html_graph_exporter import export_html_graph
     from springmap.graph.builder import build_graph
 
     out = _out_path(ctx)
@@ -164,8 +166,10 @@ def build(ctx: click.Context, project_root: str, quiet: bool) -> None:
     t0 = time.time()
     graph = build_graph(project_root, out)
 
-    json_path = export_json(graph, out)
-    md_path = export_markdown(graph, out)
+    json_path    = export_json(graph, out)
+    md_path      = export_markdown(graph, out)
+    compact_path = export_compact_markdown(graph, out)
+    html_path    = export_html_graph(graph, out)
 
     elapsed = time.time() - t0
 
@@ -195,13 +199,23 @@ def build(ctx: click.Context, project_root: str, quiet: bool) -> None:
             tbl.add_row(k, str(v))
 
         console.print(tbl)
+        compact_kb = compact_path.stat().st_size // 1024
+        md_kb      = md_path.stat().st_size // 1024
+        json_kb    = json_path.stat().st_size // 1024
+        html_kb    = html_path.stat().st_size // 1024
         console.print(
-            f"[dim]📄[/dim] GRAPH.md   → [link={md_path}]{md_path}[/link] "
-            f"[dim]({md_path.stat().st_size // 1024} KB)[/dim]"
+            f"[bold green]📎 GRAPH_COMPACT.md[/bold green] → [link={compact_path}]{compact_path}[/link] "
+            f"[dim]({compact_kb} KB  ← attach this to Copilot)[/dim]"
         )
         console.print(
-            f"[dim]📊[/dim] graph.json → [link={json_path}]{json_path}[/link] "
-            f"[dim]({json_path.stat().st_size // 1024} KB)[/dim]"
+            f"[bold cyan]🌐 graph.html      [/bold cyan] → [link={html_path}]{html_path}[/link] "
+            f"[dim]({html_kb} KB  ← open in browser)[/dim]"
+        )
+        console.print(
+            f"[dim]📄 GRAPH.md         → {md_path} ({md_kb} KB)[/dim]"
+        )
+        console.print(
+            f"[dim]📊 graph.json       → {json_path} ({json_kb} KB)[/dim]"
         )
         console.print(f"\n[bold green]✓[/bold green] Built in [bold]{elapsed:.1f}s[/bold]")
 
@@ -217,6 +231,7 @@ def update(ctx: click.Context, project_root: str) -> None:
     """Incrementally re-parse only changed files."""
     from springmap.exporters.json_exporter import export_json, load_graph_json
     from springmap.exporters.markdown_exporter import export_markdown
+    from springmap.exporters.compact_exporter import export_compact_markdown
     from springmap.graph.builder import build_graph, update_graph
     from springmap.graph.models import ProjectGraph
 
@@ -248,6 +263,7 @@ def update(ctx: click.Context, project_root: str) -> None:
 
     export_json(updated, out)
     export_markdown(updated, out)
+    export_compact_markdown(updated, out)
     console.print(
         f"[green]✓[/green] Updated [bold]{changed}[/bold] file(s) in "
         f"[bold]{time.time() - t0:.1f}s[/bold]"
@@ -275,6 +291,9 @@ def _json_to_graph(data: dict):
 
     graph = ProjectGraph(
         project_name=data.get("project_name", ""),
+        artifact_id=data.get("artifact_id", ""),
+        group_id=data.get("group_id", ""),
+        project_version=data.get("project_version", ""),
         base_package=data.get("base_package", ""),
         java_version=data.get("java_version", ""),
         spring_boot_version=data.get("spring_boot_version", ""),
@@ -796,6 +815,188 @@ def stats(ctx: click.Context, project_root: str | None) -> None:
         f"\n[dim]graph.json[/dim] {s.graph_json_kb} KB  "
         f"[dim]GRAPH.md[/dim] {s.graph_md_kb} KB"
     )
+
+
+@main.command()
+@click.argument("project_root", default=None, required=False, metavar="[PROJECT_ROOT]")
+@click.option("--open", "open_browser", is_flag=True, help="Open graph.html in default browser after generating")
+@click.pass_context
+def graph(ctx: click.Context, project_root: str | None, open_browser: bool) -> None:
+    """Generate an interactive D3.js graph of the entire project architecture.
+
+    \b
+    Opens in any browser — no server needed. Features:
+      · Force-directed layout, nodes grouped by Spring layer
+      · Click a node to see its file, endpoints, DI dependencies
+      · Filter by layer (Controllers / Services / Repositories / Entities)
+      · Search by class name
+      · Toggle DI edges, event/Kafka edges, labels
+
+    \b
+    Examples:
+      springmap graph                # regenerate graph.html
+      springmap graph --open         # regenerate + open in browser
+    """
+    if project_root is not None and ctx.obj["out_dir"] == "./springmap-out":
+        ctx.obj["out_dir"] = str(Path(project_root).resolve() / "springmap-out")
+
+    from springmap.exporters.html_graph_exporter import export_html_graph
+    from springmap.exporters.json_exporter import load_graph_json
+
+    out = _out_path(ctx)
+    data = load_graph_json(out)
+    if data is None:
+        err_console.print(
+            f"[red]No graph.json found in '{out}'.[/red]\n"
+            "Run [bold]springmap build .[/bold] first."
+        )
+        sys.exit(1)
+
+    # Reconstruct minimal graph from JSON for exporter
+    existing = _json_to_graph(data)
+    html_path = export_html_graph(existing, out)
+    kb = html_path.stat().st_size // 1024
+    console.print(
+        f"[bold green]✓[/bold green] graph.html → [cyan]{html_path}[/cyan] ({kb} KB)"
+    )
+
+    if open_browser:
+        import webbrowser
+        webbrowser.open(f"file://{html_path.resolve()}")
+        console.print("[dim]Opened in default browser.[/dim]")
+
+
+# ─────────────────────────────────────────────
+# info command
+# ─────────────────────────────────────────────
+
+
+    """Detailed project breakdown: POM coordinates, port, database, all dependencies.
+
+    \b
+    Cross-references your datasource URL against pom.xml dependencies — if your
+    URL says 'postgresql' but no PostgreSQL driver is found, it flags that.
+    Each detected Spring starter is annotated with counts from the graph:
+    how many endpoints, entities, Kafka listeners, etc.
+
+    \b
+    Examples:
+      springmap info
+      springmap info .
+    """
+    if project_root is not None and ctx.obj["out_dir"] == "./springmap-out":
+        ctx.obj["out_dir"] = str(Path(project_root).resolve() / "springmap-out")
+    engine = _require_graph(ctx)
+    r = engine.project_info()
+
+    # ── Header ─────────────────────────────────────────────────────────────
+    coords = r.group_id
+    if r.artifact_id and r.artifact_id != r.project_name:
+        coords += f":{r.artifact_id}"
+    elif r.artifact_id:
+        coords += f":{r.artifact_id}"
+    if r.project_version:
+        coords += f":{r.project_version}"
+
+    java_str  = f"Java {r.java_version}"  if r.java_version  else "Java ?"
+    sb_str    = f"Spring Boot {r.spring_boot_version}" if r.spring_boot_version else "Spring Boot ?"
+
+    console.print(Panel(
+        f"[bold]{r.project_name}[/bold]\n"
+        f"[dim]{coords}[/dim]\n"
+        f"[dim]{java_str}  ·  {sb_str}[/dim]",
+        title="🔍 Project Info",
+        border_style="bright_blue",
+    ))
+
+    # ── SERVER ─────────────────────────────────────────────────────────────
+    console.print("\n[bold]SERVER[/bold]")
+    srv = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    srv.add_column("", style="dim", width=18)
+    srv.add_column("")
+    srv.add_row("Port",         f"[bright_cyan]{r.server_port}[/bright_cyan]")
+    srv.add_row("Context Path", r.context_path or "[dim]/[/dim]")
+    profiles = ", ".join(r.active_profiles) if r.active_profiles else "[dim]default[/dim]"
+    srv.add_row("Active Profiles", profiles)
+    console.print(srv)
+
+    # ── DATABASE ───────────────────────────────────────────────────────────
+    console.print("\n[bold]DATABASE[/bold]")
+    db = r.db
+    db_tbl = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    db_tbl.add_column("", style="dim", width=18)
+    db_tbl.add_column("")
+
+    if db.url:
+        db_tbl.add_row("URL", f"[cyan]{db.url}[/cyan]")
+    else:
+        db_tbl.add_row("URL", "[dim]not configured[/dim]")
+
+    if db.driver:
+        db_tbl.add_row("Driver Class", db.driver)
+
+    if db.inferred_type != "Unknown":
+        if db.dependency_found:
+            dep_str = f"[green]✓[/green] dependency found  [dim]({db.matching_dep})[/dim]"
+        elif db.mismatch:
+            dep_str = (
+                f"[yellow]⚠[/yellow] no matching dependency in pom.xml  "
+                f"[dim](expected {db.canonical_artifact})[/dim]"
+            )
+        else:
+            dep_str = "[dim]—[/dim]"
+        db_tbl.add_row("Inferred Type", f"[bold]{db.inferred_type}[/bold]  {dep_str}")
+    elif db.url:
+        db_tbl.add_row("Inferred Type", "[dim]unrecognised URL scheme[/dim]")
+
+    db_tbl.add_row("JPA DDL Auto", r.jpa_ddl_auto or "[dim]not set[/dim]")
+    db_tbl.add_row("Show SQL",     str(r.jpa_show_sql).lower())
+    console.print(db_tbl)
+
+    # ── KEY DEPENDENCIES ───────────────────────────────────────────────────
+    console.print(f"\n[bold]KEY DEPENDENCIES[/bold]  [dim]({r.total_deps} total in pom.xml)[/dim]")
+
+    def _dep_section(title: str, items: list, style: str = "") -> None:
+        if not items:
+            return
+        console.print(f"\n  [dim]{title}[/dim]")
+        for item in items:
+            if hasattr(item, "artifact"):            # _StarterInfo
+                note = f"  [dim]{item.note}[/dim]" if item.note else ""
+                console.print(f"    [green]✓[/green] [bold]{item.label}[/bold]{note}")
+                console.print(f"      [dim]{item.artifact}[/dim]")
+            else:
+                is_db_match = (db.matching_dep and item == db.matching_dep)
+                marker = " [green]← matches datasource URL[/green]" if is_db_match else ""
+                console.print(f"    [green]✓[/green] [dim]{item}[/dim]{marker}")
+
+    _dep_section("Spring Starters",  r.starters)
+    _dep_section("Database",         r.db_deps)
+    _dep_section("Messaging",        r.messaging_deps)
+    _dep_section("Security / Auth",  r.security_deps)
+    _dep_section("Testing",          r.testing_deps)
+
+    if r.other_deps:
+        if len(r.other_deps) <= 8:
+            _dep_section("Other", r.other_deps)
+        else:
+            console.print(f"\n  [dim]Other ({len(r.other_deps)})[/dim]")
+            for d in r.other_deps[:6]:
+                console.print(f"    [dim]✓ {d}[/dim]")
+            console.print(f"    [dim]… and {len(r.other_deps) - 6} more[/dim]")
+
+    # ── CUSTOM PROPERTIES ──────────────────────────────────────────────────
+    if r.custom_props:
+        console.print(f"\n[bold]CUSTOM PROPERTIES[/bold]  "
+                      f"[dim](from application.yml / .properties)[/dim]")
+        prop_tbl = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+        prop_tbl.add_column("", style="cyan", width=38)
+        prop_tbl.add_column("", style="dim")
+        for k, v in sorted(r.custom_props.items()):
+            prop_tbl.add_row(k, v)
+        console.print(prop_tbl)
+    else:
+        console.print("\n[dim]No custom application properties found.[/dim]")
 
 
 # ─────────────────────────────────────────────
