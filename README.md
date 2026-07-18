@@ -1,9 +1,9 @@
 # SpringMap
 
-Knowledge graph builder for Spring Boot projects — optimized for LLM coding assistants (GitHub Copilot, Claude, Cursor).
+Knowledge graph builder for Spring Boot projects — optimized for LLM coding assistants (GitHub Copilot, Claude, Cursor) and multi-agent pipelines.
 
-**The problem:** Copilot reads every `.java` file on each question, burning tokens and context window.  
-**The solution:** SpringMap produces a `GRAPH.md` so complete — endpoint tables, call chains, DI map, entity schemas — that Copilot can answer most questions without opening any source file.
+**The problem:** Copilot reads every `.java` file on each question, burning tokens and context window.
+**The solution:** SpringMap produces a token-optimized structural index — plus a full reference doc and an interactive visualization — so agents answer most questions without opening a single source file.
 
 ---
 
@@ -12,10 +12,11 @@ Knowledge graph builder for Spring Boot projects — optimized for LLM coding as
 | Source | What SpringMap reads |
 |--------|---------------------|
 | `.java` files | Controllers, services, repos, entities, DI graph, method call chains, HTTP endpoints |
-| `pom.xml` / `build.gradle` | Project name, Java version, Spring Boot version, dependencies |
-| `application.yml` / `.properties` | Server port, datasource URL, JPA config, custom props |
+| `.proto` files | gRPC services, RPC methods, request/response message types (recursive discovery, any location) |
+| `pom.xml` / `build.gradle` | Project name, Java version, Spring Boot version, categorized dependencies |
+| `application.yml` / `.properties` | Server port, datasource URL, JPA config, custom props (including nested keys) |
 | `openapi.yaml` / `swagger.yaml` | Virtual controller nodes for code-generated or gateway endpoints |
-| `.proto` files | gRPC service definitions and message types |
+| Kafka / RabbitMQ / SQS / JMS annotations | `@KafkaListener`, `@RabbitListener`, `@SqsListener`, `@JmsListener`, `@EventListener`, `@Scheduled` — tracked separately from REST endpoints |
 
 ---
 
@@ -24,11 +25,8 @@ Knowledge graph builder for Spring Boot projects — optimized for LLM coding as
 ### 1. Install
 
 ```bash
-# From source (one-time)
 cd /path/to/springmap
 pip install -e .
-
-# Verify
 springmap --help
 ```
 
@@ -39,66 +37,79 @@ cd /path/to/your/spring-boot-project
 springmap build .
 ```
 
-Output in `./springmap-out/`:
-- `GRAPH_COMPACT.md` — attach **this** to Copilot when coding (token-optimized)
-- `GRAPH.md` — full detail, for human reference/browsing
-- `graph.html` — interactive D3.js visualization, open in a browser
-- `graph.json` — queried by all CLI commands
-- `manifest.json` — tracks file hashes for incremental updates
+Five files land in `./springmap-out/`:
 
-### 3. Configure Copilot to use the graph {#using-springmap-with-copilot}
+| File | Typical size (60 classes) | Use it for |
+|------|---------------------------|------------|
+| `GRAPH_COMPACT.md` | ~5K tokens | **Attach this to Copilot.** Class index, REST endpoints, DI edges, event listeners — nothing else. |
+| `GRAPH.md` | ~13K tokens | Full reference: call chains, entity fields, Maven deps. For humans, or as a fallback when the compact index doesn't resolve a question. |
+| `graph.html` | ~15–25 KB | Interactive D3.js visualization — open in any browser, zero server. |
+| `graph.json` | ~7–10K tokens | Machine format. Powers every CLI command. Never attach this to an agent. |
+| `manifest.json` | small | File-hash cache so `update` only re-parses what changed. |
 
-Attach **`springmap-out/GRAPH_COMPACT.md`**, not `GRAPH.md`. It has the
-same structural information (classes, endpoints, DI map, Kafka listeners)
-in about half the tokens — no call chains, no entity field tables, no
-Maven dependency listing. Copilot needs the index to avoid reading files;
-it doesn't need the full documentation view.
+### 3. Configure Copilot / agents to use the graph
 
-Add to `.github/copilot-instructions.md` (or your team's custom instructions):
+Attach `GRAPH_COMPACT.md` — not `GRAPH.md`, not `graph.json` — in `.github/copilot-instructions.md`:
 
-```
+```markdown
 ## Project Knowledge Graph
 
 A compact structural index lives in springmap-out/GRAPH_COMPACT.md.
 
 RULE: Before reading any .java source file, search GRAPH_COMPACT.md for:
-  - The class name you need (Class Index section, grouped by layer)
+  - The class name you need (Class Index, grouped by layer)
   - The endpoint path you need to modify (REST Endpoints table)
   - The Kafka/RabbitMQ topic you need (Event Listeners table)
   - Which class injects which (Injects / Used by lines)
 
-Only open a .java file when you need the actual method body — the
-compact index has structure, not implementation.
+Only open a .java file when you need the actual method body.
 ```
 
-**Does this actually save tokens?** Only if Copilot stops reading source
-files because of it — attaching `GRAPH_COMPACT.md` on top of Copilot's
-normal auto-file-scanning costs MORE tokens, not less. The instruction
-above exists specifically to make Copilot substitute the graph for file
-reads, not add to them. For a 60-class project, `GRAPH_COMPACT.md` is
-roughly 5,000 tokens versus ~12,000 tokens for Copilot auto-reading 10
-Java files per question — but that saving only materializes if the
-instruction is followed. Check `springmap stats` periodically; if your
-project grows past ~150 classes, `GRAPH_COMPACT.md` itself starts costing
-more than targeted file reads, and querying via the CLI (`springmap show
-X`, `springmap query "..."`) becomes the better approach for large
-codebases.
+**Does this save tokens?** Only if the agent actually stops reading source files because of it — attaching `GRAPH_COMPACT.md` on top of normal auto-file-scanning costs more, not less. For a 60-class project, `GRAPH_COMPACT.md` runs ~5K tokens versus ~12K for auto-reading 10 Java files per question — but that saving only exists if the instruction is followed. Past ~150 classes, `GRAPH_COMPACT.md` itself gets big enough that targeted CLI queries (`springmap show X`, `springmap query "..."`) beat attaching any file at all. Run `springmap stats` periodically to check where your project sits.
 
 ### 4. Keep the graph current
 
 ```bash
-# After any code change — re-parses only modified files
-springmap update .
+springmap update .    # re-parses only changed files
 ```
 
-Add as a git pre-commit hook:
+Pre-commit hook:
 
 ```bash
-# .git/hooks/pre-commit
 #!/bin/sh
+# .git/hooks/pre-commit
 springmap update .
-git add springmap-out/GRAPH_COMPACT.md springmap-out/graph.json
+git add springmap-out/GRAPH_COMPACT.md springmap-out/graph.json springmap-out/graph.html
 ```
+
+---
+
+## Multi-agent pipeline
+
+SpringMap is designed to sit underneath a research → implement → verify → test agent chain, each pinned to the model suited to its job:
+
+```
+@research (Haiku 4.5, read-only)
+    │  1. springmap show/path/query  → targeted 100–400 token answers
+    │  2. GRAPH_COMPACT.md            → broader survey when needed
+    │  3. GRAPH.md                    → fallback for call chains / entity fields
+    │  4. source files                → last resort only
+    ▼  handoff note: files+lines, cascades, auth gate, customer-data flags
+@alita (Sonnet 4.6, Spring Boot implementation)
+    │  trusts the handoff note — doesn't re-query the graph unless it's incomplete
+    ▼  handoff note: files changed, new endpoints/methods, "never cut" items touched
+@verifier (Haiku 4.5, read-only checklist)
+    │  runs `springmap update .` first to refresh the graph, then checks the diff
+    ▼
+@veronica (Sonnet 4.6, JUnit 5 / Mockito)
+       springmap show <Class> → "Injects" line = exact mock list
+       springmap endpoints    → cross-check test coverage against real endpoints
+```
+
+Each agent's `.github/agents/*.agent.md` and the shared `.github/copilot-instructions.md`
+reference `GRAPH_COMPACT.md` as the default lookup and the CLI as the escape hatch for
+single-class questions — see `PIPELINE.md` in your repo config for the full I/O diagram
+and per-stage token cost table.
 
 ---
 
@@ -108,109 +119,93 @@ git add springmap-out/GRAPH_COMPACT.md springmap-out/graph.json
 springmap [--out <dir>] COMMAND [OPTIONS]
 ```
 
-`--out` defaults to `./springmap-out`. All commands share this option.
+`--out` defaults to `./springmap-out` and is shared by every command.
 
 ### `build`
 
-Full build from scratch.
+Full parse from scratch.
 
 ```bash
 springmap build .
 springmap build /path/to/project
-springmap build . --out /tmp/my-graph
-springmap build . --quiet          # suppress progress bars
+springmap build . --quiet          # -q, suppress progress output
 ```
 
 ### `update`
 
-Incremental — only re-parses files that changed since last `build`.
+Incremental — only re-parses files changed since the last `build` (tracked via `manifest.json`). Falls back to a full build if no existing graph is found.
 
 ```bash
 springmap update .
 ```
 
-Falls back to full `build` if no existing graph is found.
-
 ### `query`
 
-Search the graph without touching any source files.
+Search the graph without touching source files.
 
 ```bash
-springmap query "user authentication"
+springmap query "user auth"                  # keyword search
 springmap query "type:service"
 springmap query "uses:UserRepository"
 springmap query "used-by:UserController"
 springmap query "path:/api/users"
-springmap query "method:POST"
-springmap query "kind:listener"
-springmap query "src:openapi"
+springmap query "method:POST path:/api"
+springmap query "kind:listener"               # rest | grpc | listener
+springmap query "src:openapi"                 # or src:proto
 springmap query "type:service user" --limit 10
-springmap query "type:repository" --json    # raw JSON output
+springmap query "type:repository" --json      # raw JSON output
 ```
-
-**Filter syntax** (combinable with keywords):
 
 | Filter | Matches |
 |--------|---------|
-| `type:service` | Node type: controller, service, repository, entity, component, configuration, dto, util, grpc, openapi |
-| `uses:ClassName` | Classes that inject `ClassName` |
-| `used-by:ClassName` | Classes that `ClassName` depends on |
-| `path:/api/v1` | Endpoints whose path contains `/api/v1` |
-| `method:POST` | Verb match — works for REST (`GET`/`POST`/…), gRPC (`RPC`), or listeners (`KAFKA`/`RABBIT`/…) |
-| `kind:rest` / `kind:grpc` / `kind:listener` | Restrict endpoint matches to one category |
-| `pkg:com.example` | Package starts with prefix |
-| `src:openapi` | Nodes sourced from OpenAPI YAML (not Java) |
-| `src:proto` | Nodes sourced from .proto files |
+| `type:X` | controller, service, repository, entity, component, configuration, dto, grpc, openapi, interface |
+| `uses:ClassName` | classes that inject `ClassName` |
+| `used-by:ClassName` | classes `ClassName` depends on |
+| `path:/api/v1` | endpoint path contains substring |
+| `method:GET` | HTTP verb match |
+| `kind:rest` / `kind:grpc` / `kind:listener` | endpoint category |
+| `pkg:com.example` | package prefix |
+| `src:openapi` / `src:proto` | non-Java-sourced nodes |
 
 ### `show`
 
-Full details for one class — metadata, endpoint table, all methods with call chains, entity fields.
+Full details for one class — metadata, DI edges, endpoint table, all methods with call chains, entity fields.
 
 ```bash
 springmap show UserService
 springmap show UserController
-springmap show User             # entity
+springmap show User             # entity — shows table name + fields
 ```
 
-Supports partial/case-insensitive name matching and suggests alternatives if not found.
+Supports partial/case-insensitive matching; suggests alternatives if not found.
 
 ### `path`
 
-Shortest dependency path between two classes (BFS across the DI graph).
+Shortest dependency path between two classes (BFS over the DI graph).
 
 ```bash
 springmap path UserController UserRepository
-springmap path OrderController EmailService
-```
-
-Output shows the full chain with relationship labels:
-
-```
-UserController → UserService → UserRepository
 ```
 
 ### `endpoints`
 
-List endpoints. **Defaults to REST only** — gRPC and message-listener methods
-are never mixed into the default view; opt into them explicitly with flags.
+Lists **REST endpoints by default** — gRPC and listener methods are never mixed in unless you ask.
 
 ```bash
-springmap endpoints                     # REST only (GET/POST/PUT/DELETE/PATCH)
+springmap endpoints                  # REST only (default)
+springmap endpoints .
 springmap endpoints --method POST
-springmap endpoints --filter "/api/v1"
-springmap endpoints --grpc              # gRPC RPCs from .proto files, only
-springmap endpoints --listeners         # @KafkaListener/@RabbitListener/@SqsListener/
-                                         # @JmsListener/@EventListener/@Scheduled, only
-springmap endpoints --all               # REST + gRPC + listeners in one table
+springmap endpoints --filter /api/v1
+springmap endpoints --grpc           # gRPC RPCs from .proto files only
+springmap endpoints --listeners      # Kafka/RabbitMQ/SQS/JMS/@EventListener/@Scheduled only
+springmap endpoints --all            # REST + gRPC + listeners together
 ```
 
-`--method` accepts any verb relevant to the category you're viewing — e.g.
-`--method KAFKA` together with `--listeners`, or `--method RPC` with `--grpc`.
+`--method` accepts any verb relevant to the category shown — `GET`/`POST`/etc. for REST, `RPC` with `--grpc`, `KAFKA`/`RABBIT`/`SCHEDULED`/etc. with `--listeners`.
 
 ### `stats`
 
-Parse quality report and size metrics, with REST/gRPC/listener endpoint
-counts broken out separately (never combined into one ambiguous total).
+Parse quality report: class counts by layer, REST/gRPC/listener endpoint counts (tracked separately, never combined into one ambiguous total), AST-parsed vs. regex-fallback counts, output file sizes.
 
 ```bash
 springmap stats
@@ -218,122 +213,99 @@ springmap stats
 
 ### `info`
 
-Deep breakdown of `pom.xml` + `application.yml`. Cross-references your
-datasource URL against your dependencies — flags it if the URL says
-`postgresql` but no PostgreSQL driver exists in the POM. Every detected
-Spring starter is annotated with graph-derived counts (e.g. "2 REST
-endpoints", "1 @KafkaListener").
+Deep breakdown of `pom.xml` + `application.yml`. Cross-references your datasource URL against your actual dependencies — flags it if the URL says `postgresql` but no PostgreSQL driver exists in the POM. Every detected Spring starter is annotated with graph-derived counts.
 
 ```bash
 springmap info
-springmap info .
 ```
 
-Shows: Maven coordinates, Java/Spring Boot versions, server port, context
-path, active profiles, datasource URL + driver + inferred DB type, JPA
-settings, every dependency grouped by category (starters, database,
-messaging, security, testing), and all custom `application.yml` properties
-flattened to dot notation (`app.kafka.topic`, `app.retry.max-attempts`, …).
+Shows: Maven coordinates, Java/Spring Boot version (resolved through parent POM, BOM import, or direct dependency — handles internal/corporate parent POMs), server port, context path, active profiles, datasource + inferred DB type + driver match, JPA settings, dependencies grouped by category (starters, database, messaging, security, testing), and custom `application.yml` properties flattened to dot notation.
 
 ### `graph`
 
-Generates an interactive D3.js force-directed graph of the entire project
-as a single self-contained HTML file — opens in any browser, no server
-needed.
+Interactive D3.js force-directed visualization of the whole architecture — single self-contained HTML file, opens in any browser, no server.
 
 ```bash
 springmap graph
-springmap graph --open     # generate + open in default browser
+springmap graph --open    # generate + open in default browser
 ```
 
-Features: nodes color-coded and shaped by Spring layer (controller = blue
-circle, service = green rect, repository = amber diamond, entity = purple
-hexagon, gRPC = magenta, Kafka consumer = dashed orange), click any node
-for a detail panel (file, endpoints, DI dependencies, listeners), filter
-by layer, search by class name, toggle DI/event edges and labels, drag to
-reposition, zoom/pan.
+Nodes are shaped and colored by Spring layer (controller = blue circle, service = green rect, repository = amber diamond, entity = purple hexagon, gRPC = magenta, Kafka consumer = dashed orange). Click any node for a detail panel (file, endpoints, DI dependencies, listeners); filter by layer, search by class name, toggle DI/event edges and labels, drag to reposition, zoom/pan.
 
-This is for human/team use — architecture reviews, onboarding, tracing
-data flows visually. It is not meant to be attached to Copilot; use
-`GRAPH_COMPACT.md` for that (see below).
+This is for humans and architecture reviews — not for attaching to Copilot; use `GRAPH_COMPACT.md` for that.
 
 ### `clean`
 
-Delete the `springmap-out/` directory.
-
 ```bash
-springmap clean
-springmap clean --yes    # skip confirmation
+springmap clean                 # delete ./springmap-out
+springmap clean .               # same — project root is optional
+springmap clean --yes           # -y, skip confirmation
 ```
 
 ---
 
-## Output files
+## Output files in detail
 
-### `GRAPH_COMPACT.md` — attach this to Copilot
+### `GRAPH_COMPACT.md`
 
-The token-optimized index. ~55% smaller than `GRAPH.md` — only class names,
-types, files, DI edges, REST endpoint table, event listener table, and
-plain method names. No call chains, no entity field details, no Maven
-section. This is the file to attach to Copilot Chat or reference in
-`.github/copilot-instructions.md`. See [Using SpringMap with Copilot](#using-springmap-with-copilot) below.
-
-### `graph.html`
-
-Self-contained interactive D3.js visualization — open in any browser, no
-server required. For humans, not for Copilot: architecture reviews, new
-engineer onboarding, tracing data flows, spotting over-coupled classes.
-Generated automatically by `build`/`update`, or on demand with `springmap graph`.
+The token-optimized index — attach this to Copilot. Contains only: class names, types, files, DI edges (`Injects:` / `Used by:`), a REST endpoint table, an event listener table, and plain method name lists. No call chains, no entity field tables, no Maven section. Roughly 55% smaller than `GRAPH.md` for the same project.
 
 ### `GRAPH.md`
 
-Structured for LLM consumption. Sections:
+Full human-readable reference. Sections:
 
 1. Project overview (tech stack, counts, config)
-2. **REST endpoint table** — every endpoint from Java controllers AND OpenAPI specs, with body type, return type
-3. **gRPC Services** — RPC methods from `.proto` files (only present if any exist)
-4. **Event Listeners & Scheduled Jobs** — Kafka/RabbitMQ/SQS/JMS/`@EventListener`/`@Scheduled` methods, kept separate from REST endpoints (only present if any exist)
+2. **REST endpoint table** — every endpoint from Java controllers AND OpenAPI specs
+3. **gRPC Services** — RPC methods from `.proto` files (present only if any exist)
+4. **Event Listeners & Scheduled Jobs** — Kafka/RabbitMQ/SQS/JMS/`@EventListener`/`@Scheduled`, kept separate from REST (present only if any exist)
 5. **Controllers** — base paths, endpoint tables, non-endpoint methods
 6. **Services** — DI dependencies, method signatures and call chains, `@Transactional` markers
 7. **Repositories** — extends, custom query methods
-8. **Entities** — table name, field list with types / columns / JPA relationships
+8. **Entities** — table name, field list with types/columns/JPA relationships
 9. **Other components** (DTOs, configs, utils, exceptions, consumers)
 10. **Configuration** — server port, datasource, JPA settings, custom props
 11. **Dependency map** — textual call chains (Controller → Service → Repository)
 12. **Maven dependencies**
 
-Use this as human-readable reference documentation. It's larger than
-`GRAPH_COMPACT.md` on purpose — it's meant to be read, not attached to
-every Copilot request.
+### `graph.html`
+
+Self-contained D3.js v7 visualization, loaded from CDN. All graph data embedded inline as JSON — works fully offline after the first load. Never attach this to an agent; it's a browser artifact, not context.
 
 ### `graph.json`
 
-Full serialized graph. Queried by all CLI commands. Never attach this to
-Copilot directly — it's larger than `GRAPH.md` and JSON syntax overhead
-wastes tokens versus the markdown exports. Schema:
+Full serialized graph. Powers every CLI command. Schema:
 
 ```json
 {
-  "project_name": "my-service",
+  "project_name": "user-service",
+  "artifact_id": "user-service",
+  "group_id": "com.example",
+  "project_version": "2.3.1",
+  "java_version": "17",
+  "spring_boot_version": "3.2.5",
+  "maven_dependencies": ["org.springframework.boot:spring-boot-starter-web", "..."],
   "classes": {
     "UserService": {
       "name": "UserService",
       "node_type": "service",
       "file_path": "src/main/java/.../UserService.java",
-      "dependencies": ["UserRepository", "EmailService"],
+      "dependencies": ["UserRepository"],
       "dependents": ["UserController"],
       "methods": [
         {
           "name": "createUser",
           "return_type": "UserDTO",
-          "parameters": [{"type": "UserCreateDTO", "name": "dto"}],
-          "calls": ["UserRepository.save()", "EmailService.sendWelcome()"],
+          "http_method": null,
+          "calls": ["UserRepository.save()"],
           "is_transactional": true,
           "signature": "UserDTO createUser(UserCreateDTO dto)"
         }
       ]
-    }
-  }
+    },
+    "UserGrpcService": { "node_type": "grpc", "methods": [ { "name": "getUser", "http_method": null } ] },
+    "UserEventConsumer": { "node_type": "component", "methods": [ { "name": "onEvent", "http_method": "KAFKA", "http_path": "user-events" } ] }
+  },
+  "config": { "server_port": "8080", "datasource_url": "jdbc:postgresql://...", "jpa_ddl_auto": "validate" }
 }
 ```
 
@@ -344,35 +316,42 @@ wastes tokens versus the markdown exports. Schema:
 ```
 springmap/
 ├── parser/
-│   ├── java_parser.py      AST (javalang) + regex fallback
-│   ├── pom_parser.py       Maven / Gradle metadata
-│   ├── config_parser.py    application.yml / .properties
-│   ├── openapi_parser.py   OpenAPI / Swagger YAML → virtual nodes
-│   └── proto_parser.py     .proto gRPC services → virtual nodes
+│   ├── java_parser.py       AST (javalang) + regex fallback; HTTP mapping + listener
+│   │                        annotation detection (@KafkaListener, @RabbitListener,
+│   │                        @SqsListener, @JmsListener, @EventListener, @Scheduled)
+│   ├── proto_parser.py      Recursive .proto discovery, gRPC services + message types
+│   ├── openapi_parser.py    Recursive OpenAPI/Swagger YAML discovery → virtual nodes
+│   ├── pom_parser.py        Maven/Gradle metadata; Spring Boot version resolved via
+│   │                        parent POM → BOM import → direct dependency fallback chain
+│   └── config_parser.py     application.yml/.properties, nested custom-property flattening
 ├── graph/
-│   ├── models.py           ClassNode, MethodInfo, ProjectGraph, …
-│   └── builder.py          Orchestrates parsers + post-parse passes
-│       ├── Interface-driven discovery (endpoints on interface → class)
-│       ├── Constructor injection detection
-│       └── Dependency resolution (dependencies + dependents edges)
+│   ├── models.py            ClassNode, MethodInfo, ProjectGraph, categorize_verb()
+│   └── builder.py           Orchestrates all parsers + post-parse passes:
+│                              • interface-driven endpoint discovery
+│                              • constructor injection detection
+│                              • dependency resolution (dependencies + dependents edges)
 ├── exporters/
-│   ├── markdown_exporter.py  LLM-optimized GRAPH.md
-│   └── json_exporter.py      graph.json + SpringMapEncoder
+│   ├── compact_exporter.py    GRAPH_COMPACT.md — token-optimized index for agents
+│   ├── markdown_exporter.py   GRAPH.md — full human-readable reference
+│   ├── html_graph_exporter.py graph.html — D3.js interactive visualization
+│   └── json_exporter.py       graph.json + SpringMapEncoder
 ├── query/
-│   └── engine.py           In-memory search, path-finding, stats
-└── cli.py                  Click CLI with rich output
+│   └── engine.py             In-memory search, path-finding, project_info(), stats
+└── cli.py                    Click CLI — 10 commands, rich terminal output
 ```
 
 ---
 
 ## Troubleshooting
 
-**`javalang` fails on some files** — expected for Java 16+ features (records, sealed classes). SpringMap automatically falls back to regex extraction. Run `springmap stats` to see the regex fallback count.
+**`javalang` fails on some files** — expected for Java 16+ features (records, sealed classes). SpringMap automatically falls back to regex extraction. Run `springmap stats` to see the regex-fallback count.
 
-**Copilot still reads source files** — check that `GRAPH.md` is attached to the Copilot context and that the custom instruction is set. The instruction must explicitly say "search GRAPH.md before opening any .java file."
+**Copilot still reads source files** — confirm `GRAPH_COMPACT.md` (not `GRAPH.md` or `graph.json`) is attached, and that your custom instruction explicitly says "search GRAPH_COMPACT.md before opening any .java file." Attaching the graph without that instruction adds tokens on top of normal auto-scanning instead of replacing it.
 
-**OpenAPI nodes not appearing** — SpringMap recursively scans the entire project (skipping `target/`, `build/`, `node_modules/`, `.git/`) for any `.yaml`/`.yml`/`.json` file containing a top-level `openapi` or `swagger` key, at any nesting depth. If a spec still isn't picked up, confirm it actually has `openapi:` or `swagger:` as a real top-level YAML/JSON key (not just mentioned in a comment), and check the file is under 5 MB.
+**OpenAPI nodes not appearing** — SpringMap recursively scans the whole project (skipping `target/`, `build/`, `node_modules/`, `.git/`) for any `.yaml`/`.yml`/`.json` file with a top-level `openapi` or `swagger` key, at any depth, under 5 MB.
 
-**gRPC / Kafka / scheduled jobs missing from `springmap endpoints`** — these are intentionally excluded from the default view. Use `springmap endpoints --grpc`, `springmap endpoints --listeners`, or `springmap endpoints --all` to see them. `springmap stats` always shows REST/gRPC/listener counts broken out separately.
+**gRPC / Kafka / scheduled jobs missing from `springmap endpoints`** — intentional. They're excluded from the default REST-only view; use `--grpc`, `--listeners`, or `--all`. `.proto` files are discovered recursively from any location under the project root (verified against `src/main/proto/`, `src/main/resources/proto/`, and project-root placements).
 
-**Spring Boot version shows blank** — SpringMap checks, in order: a direct `spring-boot-starter-parent` parent POM, a `spring-boot.version` property, a `spring-boot-dependencies` BOM import in `<dependencyManagement>`, then any direct `org.springframework.boot` dependency with an explicit version. If your build uses a fully custom internal parent with no Spring Boot version pinned anywhere in the POM itself (inherited transitively from a grandparent), it won't be resolvable from `pom.xml` alone.
+**Spring Boot version shows blank** — SpringMap checks, in order: a direct `spring-boot-starter-parent` parent POM, a `spring-boot.version` property, a `spring-boot-dependencies` BOM import in `<dependencyManagement>`, then any direct `org.springframework.boot` dependency with an explicit version. A fully custom internal parent POM with the version pinned only in a grandparent won't resolve from `pom.xml` alone.
+
+**Custom nested properties missing from `springmap info` / `GRAPH.md`** — properties are flattened recursively (`app.kafka.topic`, `app.retry.max-attempts`), up to 6 levels deep. Deeper nesting or list-of-object values aren't flattened.
