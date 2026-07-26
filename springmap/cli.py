@@ -661,6 +661,11 @@ def path(ctx: click.Context, from_class: str, to_class: str) -> None:
 @click.option("--listeners", "--events", "show_listeners", is_flag=True,
               help="Show Kafka/RabbitMQ/SQS/JMS/@EventListener/@Scheduled only")
 @click.option("--all", "show_all", is_flag=True, help="Show REST + gRPC + listeners together")
+@click.option(
+    "--clients", "include_clients", is_flag=True,
+    help="With --grpc/--all: also include gRPC services this project only CALLS "
+         "as a client (no local server implementation found), clearly marked.",
+)
 @click.pass_context
 def endpoints(
     ctx: click.Context,
@@ -670,6 +675,7 @@ def endpoints(
     show_grpc: bool,
     show_listeners: bool,
     show_all: bool,
+    include_clients: bool,
 ) -> None:
     """List REST endpoints (default), or gRPC / listener methods with flags.
 
@@ -679,9 +685,19 @@ def endpoints(
       springmap endpoints .
       springmap endpoints --method POST
       springmap endpoints --filter /api/v1
-      springmap endpoints --grpc           # gRPC RPCs only
+      springmap endpoints --grpc           # gRPC RPCs this project SERVES only
+      springmap endpoints --grpc --clients # also show gRPC services this project
+                                            # only CALLS (client stub, no local impl)
       springmap endpoints --listeners      # Kafka/RabbitMQ/@Scheduled only
       springmap endpoints --all            # everything, one table
+
+    \b
+    --grpc only shows gRPC services this project actually IMPLEMENTS (a Java
+    class here extends the protoc-generated server base class). A .proto file
+    vendored purely to generate a CLIENT stub for calling another team's
+    service is excluded by default — pass --clients to see those too, marked
+    "(client)" in the Class column so they're never confused with this
+    project's own endpoints.
     """
     if project_root is not None and ctx.obj["out_dir"] == "./springmap-out":
         ctx.obj["out_dir"] = str(Path(project_root).resolve() / "springmap-out")
@@ -700,7 +716,10 @@ def endpoints(
     else:
         kind, label = "rest", "REST Endpoints"
 
-    eps = engine.list_endpoints(method_filter=method, path_filter=path_filter, kind=kind)
+    eps = engine.list_endpoints(
+        method_filter=method, path_filter=path_filter, kind=kind,
+        include_client_only=include_clients,
+    )
 
     if not eps:
         console.print(f"[yellow]No {label.lower()} found with the given filters.[/yellow]")
@@ -709,9 +728,21 @@ def endpoints(
                 "[dim]Tip: gRPC and listener methods are hidden by default — "
                 "try --grpc or --listeners.[/dim]"
             )
+        elif kind in ("grpc", "all") and not include_clients:
+            console.print(
+                "[dim]Tip: gRPC services this project only calls (no local "
+                "implementation) are hidden by default — try --clients.[/dim]"
+            )
         return
 
-    console.print(Panel(f"{label} ({len(eps)})", border_style="bright_blue"))
+    client_count = sum(
+        1 for ep in eps
+        if ep.get("source") == "proto" and ep.get("is_locally_implemented") is False
+    )
+    title = f"{label} ({len(eps)})"
+    if client_count:
+        title += f"  [dim]· {client_count} client-only[/dim]"
+    console.print(Panel(title, border_style="bright_blue"))
 
     tbl = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
     tbl.add_column("Type", width=10, no_wrap=True)
@@ -722,10 +753,12 @@ def endpoints(
     tbl.add_column("Returns", style="dim")
 
     for ep in eps:
+        is_client_only = ep.get("source") == "proto" and ep.get("is_locally_implemented") is False
+        class_label = f"{ep['controller']} [dim italic](client)[/dim italic]" if is_client_only else ep["controller"]
         tbl.add_row(
             _method_badge(ep["http_method"]),
             ep["path"],
-            ep["controller"],
+            class_label,
             ep["handler"] + "()",
             _short_type(ep.get("request_body") or "—"),
             _short_type(ep.get("return_type") or "void"),
@@ -870,7 +903,10 @@ def graph(ctx: click.Context, project_root: str | None, open_browser: bool) -> N
 # info command
 # ─────────────────────────────────────────────
 
-
+@main.command()
+@click.argument("project_root", default=None, required=False, metavar="[PROJECT_ROOT]")
+@click.pass_context
+def info(ctx: click.Context, project_root: str | None) -> None:
     """Detailed project breakdown: POM coordinates, port, database, all dependencies.
 
     \b

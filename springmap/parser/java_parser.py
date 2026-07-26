@@ -75,6 +75,14 @@ _JAVA_KEYWORDS = frozenset({
 # Annotation attribute extraction  (THE CRITICAL FIX)
 # ─────────────────────────────────────────────
 
+def _class_reference_name(node) -> str:
+    """Extract the class name from a javalang ClassReference (e.g. Exception.class)."""
+    t = getattr(node, "type", None)
+    if t is not None:
+        return getattr(t, "name", str(t))
+    return str(node)
+
+
 def _ann_attributes(annotation) -> dict[str, str]:
     """
     Extract key→value attributes from a javalang Annotation node.
@@ -82,6 +90,14 @@ def _ann_attributes(annotation) -> dict[str, str]:
     CRITICAL: javalang uses ElementValuePair for key=value pairs, NOT MemberValuePair.
     We use hasattr() instead of isinstance() so this works across all javalang versions
     and never raises AttributeError.
+
+    BUG FIX: two attribute-value node types were previously unhandled and fell
+    through to `str(val)`, which returns Python's repr() of the raw AST node —
+    e.g. `@Transactional(rollbackFor = Exception.class)` produced the literal
+    string "ClassReference(postfix_operators=[], ..., name=Exception, ...)"
+    instead of "Exception". Both are now resolved to clean class names:
+      - ClassReference       : @Annotation(rollbackFor = Exception.class)
+      - ElementArrayValue    : @Annotation(rollbackFor = {A.class, B.class})
     """
     el = annotation.element
     if el is None:
@@ -95,6 +111,10 @@ def _ann_attributes(annotation) -> dict[str, str]:
     if isinstance(el, javalang.tree.MemberReference):
         return {"value": str(el.member)}
 
+    # @Annotation(SomeClass.class)  e.g. bare rollbackFor = Exception.class with no key
+    if hasattr(javalang.tree, "ClassReference") and isinstance(el, javalang.tree.ClassReference):
+        return {"value": _class_reference_name(el)}
+
     # @Annotation(key="v1", key2="v2")  ← uses ElementValuePair, not MemberValuePair
     if isinstance(el, list):
         result: dict[str, str] = {}
@@ -107,13 +127,30 @@ def _ann_attributes(annotation) -> dict[str, str]:
                 result[item.name] = val.value.strip('"').strip("'")
             elif isinstance(val, javalang.tree.MemberReference):
                 result[item.name] = str(val.member)
+            elif hasattr(javalang.tree, "ClassReference") and isinstance(val, javalang.tree.ClassReference):
+                # e.g. @Transactional(rollbackFor = Exception.class)
+                result[item.name] = _class_reference_name(val)
             elif hasattr(javalang.tree, "ArrayInitializer") and isinstance(val, javalang.tree.ArrayInitializer):
+                # e.g. @RequestMapping(value={"/a", "/b"})  — join ALL values, not just the first
                 values = [
                     v.value.strip('"').strip("'")
                     for v in (val.initializers or [])
                     if isinstance(v, javalang.tree.Literal)
                 ]
-                result[item.name] = values[0] if len(values) == 1 else (values[0] if values else "")
+                result[item.name] = ", ".join(values) if values else ""
+            elif hasattr(javalang.tree, "ElementArrayValue") and isinstance(val, javalang.tree.ElementArrayValue):
+                # e.g. @Transactional(rollbackFor = {IOException.class, SQLException.class})
+                parts: list[str] = []
+                for v in (val.values or []):
+                    if hasattr(javalang.tree, "ClassReference") and isinstance(v, javalang.tree.ClassReference):
+                        parts.append(_class_reference_name(v))
+                    elif isinstance(v, javalang.tree.Literal):
+                        parts.append(v.value.strip('"').strip("'"))
+                    elif isinstance(v, javalang.tree.MemberReference):
+                        parts.append(str(v.member))
+                    else:
+                        parts.append(str(v))
+                result[item.name] = ", ".join(parts)
             else:
                 result[item.name] = str(val)
         return result
@@ -134,20 +171,48 @@ def _parse_annotations(raw_annotations: list) -> list[AnnotationInfo]:
 
 
 def _resolve_type_name(ref_type) -> str:
+    """
+    BUG FIX (array dimensions): array dimensions were silently dropped. javalang
+    represents an array type by putting the element type's name on the node
+    (BasicType or ReferenceType) and the "[]" count separately in `.dimensions`
+    — a list with one entry (typically None) per bracket pair. The old code
+    never read `.dimensions` at all, so `byte[]` resolved to `byte`,
+    `String[]` resolved to `String`, and `KafkaTemplate<String, byte[]>`
+    resolved to `KafkaTemplate<String, byte>` everywhere this function was
+    used: field types, method parameter types, method return types, and
+    generic type arguments (all go through this same function).
+
+    BUG FIX (qualified inline types): a fully-qualified type written inline
+    without an import — e.g. `org.springframework.kafka.core.KafkaTemplate<...>`
+    — is represented by javalang as a chain of ReferenceType nodes linked via
+    `.sub_type`, one per dot-separated segment, with the ACTUAL class name
+    (and its generic arguments / array dimensions) on the innermost node. The
+    old code only ever read the outermost node's `.name`, which is just the
+    first package segment (e.g. "org"). Now walks to the innermost `.sub_type`
+    before extracting name/arguments/dimensions. Most real Spring Boot code
+    uses imports + short names (unaffected by this particular gap), but
+    inline-qualified usage does occur (avoiding import collisions, etc.).
+    """
     if ref_type is None:
         return "void"
     if isinstance(ref_type, javalang.tree.BasicType):
-        return ref_type.name
+        suffix = "[]" * len(ref_type.dimensions or [])
+        return ref_type.name + suffix
     if isinstance(ref_type, javalang.tree.ReferenceType):
-        name = ref_type.name
-        if ref_type.arguments:
+        # Walk to the innermost segment of a dotted qualified-type chain
+        node = ref_type
+        while getattr(node, "sub_type", None) is not None:
+            node = node.sub_type
+        name = node.name
+        if node.arguments:
             args = ", ".join(
                 _resolve_type_name(a.type)
-                for a in ref_type.arguments
+                for a in node.arguments
                 if hasattr(a, "type") and a.type is not None
             )
-            return f"{name}<{args}>"
-        return name
+            name = f"{name}<{args}>"
+        suffix = "[]" * len(node.dimensions or [])
+        return name + suffix
     return str(ref_type)
 
 # ─────────────────────────────────────────────
@@ -322,16 +387,74 @@ def _detect_node_type(
     implements: list[str],
     is_interface: bool,
 ) -> NodeType:
-    if is_interface:
-        return NodeType.INTERFACE
+    """
+    BUG FIX: the previous version had `if is_interface: return NodeType.INTERFACE`
+    as the very FIRST check — before annotations, before extends, before anything.
+    This meant an interface literally annotated @Repository and extending
+    JpaRepository<X, Y> (the single most common Spring Data JPA pattern in
+    existence) was classified as generic "interface" instead of "repository",
+    because the short-circuit fired before the annotation loop or the
+    "jparepository" extends check ever ran. The same short-circuit misclassified
+    generated DTO-contract interfaces (e.g. "HoldRequestDto", an interface with
+    only getter methods, produced by openapi-generator) as generic "interface"
+    instead of "dto".
+
+    Fix: annotations, extends-based repository/grpc detection, and
+    implements-based DTO/repository detection now run BEFORE is_interface is
+    consulted. is_interface only decides the final fallback bucket (DTO by name,
+    else plain INTERFACE) when nothing more specific matched — preserving the
+    original behavior for genuine service-contract interfaces like HoldService/
+    WalletService, which correctly still resolve to plain INTERFACE.
+    """
+    # 1. Explicit annotations are the strongest signal — always checked first,
+    #    regardless of interface/class.
     for ann in annotations:
         if ann.name in ANNOTATION_TO_TYPE:
             return ANNOTATION_TO_TYPE[ann.name]
-    name_lower = class_name.lower()
+
+    # 2. protoc-generated gRPC base classes always look like XxxGrpc.XxxImplBase.
+    #    _resolve_type_name walks qualified-type chains to their innermost
+    #    segment (see that function's docstring — fixed to correctly resolve
+    #    fully-qualified inline types), so `extends` here resolves to just
+    #    "XxxImplBase", not the outer "XxxGrpc" wrapper name. REGRESSION FIX:
+    #    the original check here (`"grpc" in extends.lower()`) was written
+    #    before that innermost-segment fix existed and silently broke once it
+    #    landed — "holdserviceimplbase" contains no "grpc" substring, so a
+    #    gRPC impl class with no @GrpcService annotation fell through to the
+    #    name-suffix heuristics and was misclassified as a plain @Service.
+    #    Checking the ImplBase suffix (the now-common resolved form) in
+    #    addition to the substring check (kept for any javalang version or
+    #    qualifier-depth variation that still surfaces the outer name) fixes
+    #    this without narrowing what the original check covered.
+    if extends and (extends.lower().endswith("implbase") or "grpc" in extends.lower()):
+        return NodeType.GRPC
+
+    # 3. JpaRepository / repository-interface detection — the extends/implements
+    #    check must run regardless of is_interface, since Spring Data repositories
+    #    ARE interfaces by convention and this is their primary structural signal.
     if extends and "jparepository" in extends.lower():
         return NodeType.REPOSITORY
     if any("repository" in i.lower() for i in implements):
         return NodeType.REPOSITORY
+
+    # 4. DTO-contract interfaces (openapi-generator style: an interface with only
+    #    getter methods, named FooRequestDto / FooResponseDto) — also checked via
+    #    the implements list, since adapter classes implementing such an
+    #    interface are themselves DTO representations (see step 6 below for the
+    #    class-side equivalent of this check).
+    name_lower = class_name.lower()
+    if name_lower.endswith(("dto", "request", "response")):
+        return NodeType.DTO
+    if any(i.lower().endswith(("dto", "request", "response")) for i in implements):
+        return NodeType.DTO
+
+    # 5. Now that every structural/annotation signal has been exhausted, an
+    #    interface that matched none of the above is a genuine plain interface
+    #    (service contracts like HoldService/WalletService land here correctly).
+    if is_interface:
+        return NodeType.INTERFACE
+
+    # 6. Remaining name-suffix heuristics — classes only from here on.
     if name_lower.endswith("controller"):
         return NodeType.CONTROLLER
     if name_lower.endswith(("service", "serviceimpl")):
@@ -340,7 +463,7 @@ def _detect_node_type(
         return NodeType.REPOSITORY
     if name_lower.endswith("entity"):
         return NodeType.ENTITY
-    if name_lower.endswith(("dto", "request", "response", "record")):
+    if name_lower.endswith("record"):
         return NodeType.DTO
     if name_lower.endswith(("config", "configuration")):
         return NodeType.CONFIGURATION
@@ -350,6 +473,13 @@ def _detect_node_type(
         return NodeType.COMPONENT
     if name_lower.endswith(("util", "utils", "helper")):
         return NodeType.UTIL
+    if name_lower.endswith("constants"):
+        return NodeType.UTIL
+    # Adapter-pattern classes implementing a DTO-contract interface (common in
+    # gRPC<->REST translation layers) — implements-based DTO detection for
+    # classes, mirroring step 4's interface-side check.
+    if any(i.lower().endswith(("dto", "request", "response")) for i in implements):
+        return NodeType.DTO
     return NodeType.UNKNOWN
 
 

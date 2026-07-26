@@ -5,7 +5,7 @@ model: 'Claude Haiku 4.5'
 tools: ['search', 'codebase', 'usages']
 handoffs:
   - label: 'Implement this'
-    agent: alita
+    agent: Alita
     prompt: 'Implement the change scoped in the handoff note above. Follow your own instructions plus .github/copilot-instructions.md.'
     send: false
 ---

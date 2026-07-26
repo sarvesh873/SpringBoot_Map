@@ -42,9 +42,23 @@ _RE_RPC = re.compile(
 # message Foo { ... }  — non-recursive, handles single-level nesting heuristically
 _RE_MESSAGE = re.compile(r"message\s+(\w+)\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", re.DOTALL)
 # field:  [repeated] type name = N;
+#
+# NOTE: no longer anchored to line-start (^) with MULTILINE — the previous
+# version only matched the FIRST field-like statement per physical line, so
+# a message body with multiple field declarations crammed onto one line
+# (unusual, but not invalid proto3 syntax) silently lost every field after
+# the first on that line. Doesn't require a preceding newline; each field
+# declaration is self-contained (type + name + "= N") so removing the
+# anchor doesn't introduce false positives.
 _RE_PROTO_FIELD = re.compile(
-    r"^\s*(?:repeated\s+|optional\s+|required\s+)?(\w+)\s+(\w+)\s*=\s*\d+",
-    re.MULTILINE,
+    r"(?:repeated\s+|optional\s+|required\s+)?(\w+)\s+(\w+)\s*=\s*\d+",
+)
+# map<KeyType, ValueType> name = N;  — the standard scalar-field regex above
+# requires a single \w+ token for the type, which never matches "map<K, V>"
+# (angle brackets and the comma aren't \w characters), so map fields need
+# their own pattern. Same line-anchor removal as above, for the same reason.
+_RE_PROTO_MAP_FIELD = re.compile(
+    r"map\s*<\s*(\w+)\s*,\s*(\w+)\s*>\s*(\w+)\s*=\s*\d+",
 )
 
 # Maps proto scalar types to Java types
@@ -116,15 +130,38 @@ def parse_proto_file(path: Path, project_root: str) -> list[ClassNode]:
     package = pkg_match.group(1) if pkg_match else "proto.generated"
 
     # ── Collect all message types for type resolution ──
+    #
+    # BUG FIX (map fields): the scalar _RE_PROTO_FIELD pattern requires a
+    # single-word type token, so `map<string, string> metadata = 2;` never
+    # matched and was silently dropped from the message's field list. Map
+    # fields are now matched separately via _RE_PROTO_MAP_FIELD and rendered
+    # as a Java-style Map<K, V> type — confirmed missing in real output
+    # (ReleaseHoldRequestGRPC.metadata) before this fix.
     messages: dict[str, list[FieldInfo]] = {}
     for m in _RE_MESSAGE.finditer(clean):
         msg_name = m.group(1)
         body = m.group(2)
+
+        # Map fields first, so their span doesn't also get partially matched
+        # by the scalar pattern below (map<string,string> metadata = 2; has
+        # no standalone \w+ \w+ = N shape that would double-match, but this
+        # keeps map-field lines out of the scalar loop's line-by-line scan).
+        map_field_lines: set[int] = set()
         fields: list[FieldInfo] = []
+        for fm in _RE_PROTO_MAP_FIELD.finditer(body):
+            key_type, val_type, fname = fm.group(1), fm.group(2), fm.group(3)
+            fields.append(FieldInfo(
+                name=fname,
+                type=f"Map<{_java_type(key_type)}, {_java_type(val_type)}>",
+            ))
+            map_field_lines.add(fm.start())
+
         for fm in _RE_PROTO_FIELD.finditer(body):
             proto_type, fname = fm.group(1), fm.group(2)
             if fname in ("reserved", "option", "oneof", "map"):
                 continue
+            if proto_type == "map":
+                continue  # already captured by the map-field pass above
             fields.append(FieldInfo(name=fname, type=_java_type(proto_type)))
         messages[msg_name] = fields
 
@@ -173,10 +210,36 @@ def parse_proto_file(path: Path, project_root: str) -> list[ClassNode]:
         nodes.append(grpc_node)
         log.debug("Proto: gRPC service %s with %d RPCs", svc_name, len(methods))
 
-    # ── Create entity/DTO nodes for message types used in RPC signatures ──
+    # ── Transitive closure: include message types referenced as a FIELD of
+    # an already-included message, not just types used directly at the top
+    # level of an RPC signature. ──
+    #
+    # BUG FIX: a message like ListHoldsRequestGRPC (a top-level RPC request
+    # type, so included) commonly has a field `PaginationRequestGRPC
+    # pagination = 4;` — a message type that is itself NEVER a top-level RPC
+    # request/response, only ever referenced as a field of another message.
+    # The old code only ever checked rpc_types_used (direct top-level
+    # references), so PaginationRequestGRPC/PaginationResponseGRPC-style
+    # types were silently excluded from the graph entirely, even though
+    # they're real types actively used by real, included RPC messages.
+    # Confirmed by their absence in real output despite being referenced.
+    included = set(rpc_types_used)
+    worklist = list(rpc_types_used)
+    while worklist:
+        current = worklist.pop()
+        for field in messages.get(current, []):
+            # Strip Map<K, V> / List<T> wrappers to find the bare referenced type
+            candidates = re.findall(r"[A-Za-z_]\w*", field.type)
+            for cand in candidates:
+                if cand in messages and cand not in included:
+                    included.add(cand)
+                    worklist.append(cand)
+
+    # ── Create entity/DTO nodes for every message type in the transitive
+    # closure of what RPC signatures actually reference. ──
     for msg_name, fields in messages.items():
-        if msg_name not in rpc_types_used:
-            continue  # Only create nodes for types referenced in service contracts
+        if msg_name not in included:
+            continue  # Not reachable from any RPC signature — skip
         msg_node = ClassNode(
             name=msg_name,
             package=package,

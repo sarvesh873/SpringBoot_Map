@@ -38,6 +38,7 @@ ANNOTATION_TO_TYPE: dict[str, NodeType] = {
     "ControllerAdvice": NodeType.EXCEPTION,
     "RestControllerAdvice": NodeType.EXCEPTION,
     "FeignClient": NodeType.OPENAPI,          # Feign clients define API contracts
+    "GrpcService": NodeType.GRPC,             # net.devh:grpc-spring-boot-starter server impls
 }
 
 HTTP_MAPPING_ANNOTATIONS = {
@@ -182,6 +183,13 @@ class ClassNode:
     dependencies: list[str] = field(default_factory=list)   # class names this node depends on
     dependents: list[str] = field(default_factory=list)     # class names that depend on this node
     source: str = "java"                 # "java" | "openapi" | "proto"
+    # Only meaningful for node_type=GRPC + source="proto" (a service{} block
+    # parsed from a .proto file). True if a Java class in THIS repo extends
+    # {ServiceName}Grpc (the protoc-generated server base class) — meaning
+    # this repo actually SERVES the RPCs, not just holds client-stub-generating
+    # proto definitions for CALLING another team's service. None for any node
+    # this distinction doesn't apply to (everything except proto-sourced GRPC).
+    is_locally_implemented: Optional[bool] = None
 
     @property
     def full_name(self) -> str:
@@ -220,6 +228,7 @@ class ClassNode:
             "dependencies": self.dependencies,
             "dependents": self.dependents,
             "parse_error": self.parse_error,
+            "is_locally_implemented": self.is_locally_implemented,
         }
 
 
@@ -251,6 +260,9 @@ class ProjectConfig:
 @dataclass
 class ProjectGraph:
     project_name: str = "Unknown"
+    artifact_id: str = ""          # Maven artifactId (same as project_name for most projects)
+    group_id: str = ""             # Maven groupId  (stored separately from base_package)
+    project_version: str = ""      # Maven <version>
     base_package: str = ""
     java_version: str = ""
     spring_boot_version: str = ""
@@ -335,6 +347,9 @@ class ProjectGraph:
     def to_dict(self) -> dict:
         return {
             "project_name": self.project_name,
+            "artifact_id": self.artifact_id,
+            "group_id": self.group_id,
+            "project_version": self.project_version,
             "base_package": self.base_package,
             "java_version": self.java_version,
             "spring_boot_version": self.spring_boot_version,
